@@ -18,9 +18,13 @@ const registerSocketHandlers = (io) => {
 
 
 const initializeSocket = (server) => {
+    const frontendUrl = process.env.FRONTEND_URL || "https://real-time-video-call-nine.vercel.app";
+    // Remove trailing slash if present
+    const origin = frontendUrl.endsWith('/') ? frontendUrl.slice(0, -1) : frontendUrl;
+    
     const io = socket(server, {
         cors: {
-            origin: process.env.FRONTEND_URL || "https://real-time-video-call-nine.vercel.app/",
+            origin: origin,
             methods: ["GET", "POST"],
         },
     })

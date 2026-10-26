@@ -1,12 +1,29 @@
 // WebRTC peer connection configuration with public STUN servers
 // STUN helps discover public IP for NAT traversal
-// TURN servers may be needed for restrictive networks (not configured here)
-const iceServers = {
-  iceServers: [
+// TURN servers may be needed for restrictive networks (configured via environment)
+function getIceServers() {
+  const iceServers = [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
-  ],
-};
+  ];
+
+  // Add TURN server if configured
+  const turnUrls = import.meta.env.VITE_TURN_URLS;
+  const turnUsername = import.meta.env.VITE_TURN_USERNAME;
+  const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL;
+
+  if (turnUrls && turnUsername && turnCredential) {
+    const urls = turnUrls.split(',').map(url => url.trim());
+    iceServers.push({
+      urls,
+      username: turnUsername,
+      credential: turnCredential,
+    });
+    console.log("[WebRTC] TURN server configured");
+  }
+
+  return { iceServers };
+}
 
 /**
  * Creates and configures an RTCPeerConnection
@@ -22,29 +39,48 @@ export function createPeerConnection(
   onTrack,
   onConnectionStateChange
 ) {
-  const peerConnection = new RTCPeerConnection(iceServers);
+  const peerConnection = new RTCPeerConnection(getIceServers());
 
-  // Add local stream tracks to the peer connection
+  // Add local stream tracks to the peer connection if available
   if (localStream) {
     localStream.getTracks().forEach((track) => {
       peerConnection.addTrack(track, localStream);
     });
+    console.log("[WebRTC] Added local tracks:", localStream.getTracks().length);
+  } else {
+    // If no local stream, add transceivers to receive remote media
+    console.log("[WebRTC] No local stream, adding transceivers for receive-only");
+    peerConnection.addTransceiver("video");
+    peerConnection.addTransceiver("audio");
   }
 
   // Handle ICE candidate generation
   peerConnection.onicecandidate = (event) => {
     if (event.candidate) {
+      console.log("[WebRTC] ICE candidate generated");
       onIceCandidate(event.candidate);
+    } else {
+      console.log("[WebRTC] ICE gathering complete");
     }
   };
 
   // Handle incoming remote stream
   peerConnection.ontrack = (event) => {
-    console.log("[WebRTC] ontrack fired, streams:", event.streams.length);
-    if (event.streams[0]) {
-      console.log("[WebRTC] Remote stream tracks:", event.streams[0].getTracks().length);
+    console.log("[WebRTC] ontrack fired, streams:", event.streams.length, "track kind:", event.track.kind);
+    
+    // Handle both cases: when streams array is populated and when it's not
+    let remoteStream;
+    if (event.streams && event.streams.length > 0) {
+      remoteStream = event.streams[0];
+      console.log("[WebRTC] Remote stream from event.streams[0], tracks:", remoteStream.getTracks().length);
+    } else {
+      // Create a new stream if none provided (some browsers do this)
+      remoteStream = new MediaStream();
+      remoteStream.addTrack(event.track);
+      console.log("[WebRTC] Created new remote stream for track:", event.track.kind);
     }
-    onTrack(event.streams[0]);
+    
+    onTrack(remoteStream);
   };
 
   // Handle connection state changes
@@ -57,6 +93,11 @@ export function createPeerConnection(
   peerConnection.oniceconnectionstatechange = () => {
     console.log("[WebRTC] ICE connection state changed:", peerConnection.iceConnectionState);
     onConnectionStateChange(peerConnection.iceConnectionState);
+  };
+
+  // Handle signaling state changes
+  peerConnection.onsignalingstatechange = () => {
+    console.log("[WebRTC] Signaling state changed:", peerConnection.signalingState);
   };
 
   return peerConnection;

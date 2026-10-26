@@ -5,8 +5,9 @@ import { createFakeCamera } from "./fakeCamera";
  * - Development mode: Uses simulated camera (Canvas API)
  * - Production mode: Requests real camera and microphone
  * 
- * @returns {Promise<MediaStream>} The media stream
- * @throws {Error} If media acquisition fails
+ * Returns null if media acquisition fails, allowing receive-only WebRTC connections
+ * 
+ * @returns {Promise<MediaStream|null>} The media stream, or null if acquisition fails
  */
 export async function getMediaStream() {
   const isProduction = import.meta.env.MODE === "production";
@@ -17,7 +18,8 @@ export async function getMediaStream() {
       console.log("[Media] Requesting real camera and microphone in production mode");
       
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error("Browser does not support mediaDevices.getUserMedia");
+        console.warn("[Media] Browser does not support mediaDevices.getUserMedia");
+        return null;
       }
 
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -30,18 +32,24 @@ export async function getMediaStream() {
     } catch (error) {
       console.error("[Media] Failed to acquire real media:", error);
       
-      // Provide user-friendly error messages
+      // Return null instead of throwing to allow receive-only mode
+      // The UI will show the specific error message
+      let errorMessage;
       if (error.name === "NotAllowedError" || error.name === "PermissionDeniedError") {
-        throw new Error("Camera and microphone permission denied. Please allow access in your browser settings.");
+        errorMessage = "Camera and microphone permission denied. You can still receive remote video.";
       } else if (error.name === "NotFoundError" || error.name === "DevicesNotFoundError") {
-        throw new Error("No camera or microphone found. Please connect a device and try again.");
+        errorMessage = "No camera or microphone found. You can still receive remote video.";
       } else if (error.name === "NotReadableError" || error.name === "TrackStartError") {
-        throw new Error("Camera or microphone is already in use by another application.");
+        errorMessage = "Camera or microphone is already in use. You can still receive remote video.";
       } else if (error.name === "OverconstrainedError" || error.name === "ConstraintNotSatisfiedError") {
-        throw new Error("Camera does not support the requested constraints.");
+        errorMessage = "Camera does not support the requested constraints. You can still receive remote video.";
       } else {
-        throw new Error(`Failed to access camera and microphone: ${error.message}`);
+        errorMessage = `Failed to access camera and microphone: ${error.message}. You can still receive remote video.`;
       }
+      
+      console.warn("[Media]", errorMessage);
+      // Store error message in a way that can be retrieved by the component
+      throw new Error(errorMessage);
     }
   } else {
     // Development mode: Use simulated camera

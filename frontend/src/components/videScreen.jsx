@@ -26,6 +26,7 @@ function VideoScreen() {
   const [cameraLabel, setCameraLabel] = useState(getCameraLabel());
   const [isMicMuted, setIsMicMuted] = useState(false);
   const [isCameraOff, setIsCameraOff] = useState(false);
+  const [remoteDescriptionSet, setRemoteDescriptionSet] = useState(false);
 
   const localVideoRef = useRef(null);
   const localStreamRef = useRef(null);
@@ -85,10 +86,19 @@ function VideoScreen() {
         console.log("[VideoScreen] Creating peer connection for offer");
         setupPeerConnection();
       }
+      
+      // Check again after setupPeerConnection in case it failed
+      if (!peerConnectionRef.current) {
+        console.error("[VideoScreen] Failed to create peer connection for offer");
+        setMessage("Failed to establish connection - peer connection not available");
+        return;
+      }
+
       try {
         await createAnswer(peerConnectionRef.current, offer);
         console.log("[VideoScreen] Answer created, sending to:", socketId);
         newSocket.emit("webrtc-answer", { roomId: activeRoomRef.current, answer: peerConnectionRef.current.localDescription });
+        setRemoteDescriptionSet(true);
         setConnectionState("connecting");
         setMessage("Establishing WebRTC connection...");
       } catch (error) {
@@ -99,11 +109,30 @@ function VideoScreen() {
 
     newSocket.on("webrtc-answer", async ({ answer }) => {
       console.log("[VideoScreen] webrtc-answer received");
+      
+      if (!peerConnectionRef.current) {
+        console.error("[VideoScreen] Peer connection is null when receiving answer");
+        setMessage("Failed to establish connection - peer connection not available");
+        return;
+      }
+
       try {
         await setRemoteDescription(peerConnectionRef.current, answer);
         console.log("[VideoScreen] Remote description set");
+        setRemoteDescriptionSet(true);
         setConnectionState("connecting");
         setMessage("Establishing WebRTC connection...");
+        
+        // Process queued ICE candidates now that remote description is set
+        while (pendingCandidatesRef.current.length > 0) {
+          const candidate = pendingCandidatesRef.current.shift();
+          try {
+            await addIceCandidate(peerConnectionRef.current, candidate);
+            console.log("[VideoScreen] Processed queued ICE candidate after remote description");
+          } catch (error) {
+            console.error("[VideoScreen] Error adding queued ICE candidate:", error);
+          }
+        }
       } catch (error) {
         console.error("Error setting remote description:", error);
         setMessage("Failed to establish connection.");
@@ -112,17 +141,26 @@ function VideoScreen() {
 
     newSocket.on("webrtc-ice-candidate", async ({ candidate }) => {
       console.log("[VideoScreen] webrtc-ice-candidate received");
-      if (peerConnectionRef.current) {
-        try {
-          await addIceCandidate(peerConnectionRef.current, candidate);
-          console.log("[VideoScreen] ICE candidate added");
-        } catch (error) {
-          console.error("Error adding ICE candidate:", error);
-        }
-      } else {
+      
+      if (!peerConnectionRef.current) {
         // Queue candidates until peer connection is ready
         console.log("[VideoScreen] Queuing ICE candidate (peer connection not ready)");
         pendingCandidatesRef.current.push(candidate);
+        return;
+      }
+
+      // Queue candidates until remote description is set
+      if (!remoteDescriptionSet) {
+        console.log("[VideoScreen] Queuing ICE candidate (remote description not set)");
+        pendingCandidatesRef.current.push(candidate);
+        return;
+      }
+
+      try {
+        await addIceCandidate(peerConnectionRef.current, candidate);
+        console.log("[VideoScreen] ICE candidate added");
+      } catch (error) {
+        console.error("Error adding ICE candidate:", error);
       }
     });
 
@@ -135,10 +173,8 @@ function VideoScreen() {
   }, []);
 
   const setupPeerConnection = () => {
-    if (!localStreamRef.current) {
-      console.error("No local stream available");
-      return;
-    }
+    // Allow peer connection creation even without local stream (receive-only mode)
+    console.log("[VideoScreen] Setting up peer connection, local stream:", !!localStreamRef.current);
 
     const peerConnection = createPeerConnection(
       localStreamRef.current,
@@ -150,11 +186,16 @@ function VideoScreen() {
         if (remoteVideoRef.current) {
           console.log("[VideoScreen] Assigning stream to remote video element");
           remoteVideoRef.current.srcObject = remoteStream;
+          // Attempt to play the video to handle autoplay restrictions
+          remoteVideoRef.current.play().catch(err => {
+            console.warn("[VideoScreen] Autoplay failed:", err);
+          });
         } else {
           console.log("[VideoScreen] remoteVideoRef.current is null, cannot assign stream");
         }
       },
       (state) => {
+        console.log("[VideoScreen] Connection state changed to:", state);
         setConnectionState(state);
         if (state === "connected") {
           setMessage("Video call connected!");
@@ -165,11 +206,13 @@ function VideoScreen() {
     );
 
     peerConnectionRef.current = peerConnection;
+    console.log("[VideoScreen] Peer connection created and stored in ref");
 
     // Process any queued ICE candidates
     while (pendingCandidatesRef.current.length > 0) {
       const candidate = pendingCandidatesRef.current.shift();
       addIceCandidate(peerConnection, candidate);
+      console.log("[VideoScreen] Processed queued ICE candidate");
     }
   };
 
@@ -203,6 +246,7 @@ function VideoScreen() {
       peerConnectionRef.current = null;
     }
     pendingCandidatesRef.current = [];
+    setRemoteDescriptionSet(false);
     if (remoteVideoRef.current) {
       remoteVideoRef.current.srcObject = null;
     }
@@ -222,18 +266,25 @@ function VideoScreen() {
       try {
         setMessage("Requesting camera and microphone...");
         const stream = await getMediaStream();
-        localStreamRef.current = stream;
+        
+        if (stream) {
+          localStreamRef.current = stream;
 
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = stream;
+          if (localVideoRef.current) {
+            localVideoRef.current.srcObject = stream;
+          }
+
+          setMessage("Camera and microphone ready.");
+        } else {
+          console.warn("[VideoScreen] No local stream available, will use receive-only mode");
+          localStreamRef.current = null;
+          setMessage("No camera/microphone available. You can still receive remote video.");
         }
-
-        setMessage("Camera and microphone ready.");
       } catch (error) {
         console.error("Failed to acquire media:", error);
-        setMessage(error.message || "Failed to access camera and microphone.");
-        // Don't proceed with WebRTC if media acquisition failed
-        return;
+        setMessage(error.message || "Failed to access camera and microphone. You can still receive remote video.");
+        // Continue with WebRTC in receive-only mode
+        localStreamRef.current = null;
       }
     };
 
