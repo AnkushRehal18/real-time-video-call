@@ -20,7 +20,7 @@ const registerSocketHandlers = (io) => {
 const initializeSocket = (server) => {
     const io = socket(server, {
         cors: {
-            origin: process.env.FRONTEND_URL || "http://localhost:5173",
+            origin: process.env.FRONTEND_URL || "https://real-time-video-call-nine.vercel.app/",
             methods: ["GET", "POST"],
         },
     })
