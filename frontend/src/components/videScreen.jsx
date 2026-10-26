@@ -1,5 +1,4 @@
-
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { io } from "socket.io-client";
 import { getMediaStream, stopMediaStream, getCameraLabel } from "../utils/media";
 import {
@@ -13,31 +12,148 @@ import {
 import "../App.css";
 
 const SOCKET_URL = import.meta.env.VITE_BASE_URL;
+const CAMERA_LABEL = getCameraLabel();
 
 function VideoScreen() {
-  const [socket, setSocket] = useState(null);
   const [roomId, setRoomId] = useState("");
   const [message, setMessage] = useState("Connecting to server...");
   const [connected, setConnected] = useState(false);
   const [activeRoom, setActiveRoom] = useState("");
   const [participantJoined, setParticipantJoined] = useState(false);
   const [connectionState, setConnectionState] = useState("disconnected");
-  const [isInitiator, setIsInitiator] = useState(false);
-  const [cameraLabel, setCameraLabel] = useState(getCameraLabel());
   const [isMicMuted, setIsMicMuted] = useState(false);
   const [isCameraOff, setIsCameraOff] = useState(false);
-  const [remoteDescriptionSet, setRemoteDescriptionSet] = useState(false);
+  // Tracks whether we currently have a local media stream so controls can be
+  // enabled/disabled correctly without reading a ref during render.
+  const [hasLocalStream, setHasLocalStream] = useState(false);
 
   const localVideoRef = useRef(null);
   const localStreamRef = useRef(null);
   const remoteVideoRef = useRef(null);
   const peerConnectionRef = useRef(null);
+
+  // ICE candidates received before the remote description is set are buffered
+  // here and applied once the remote description is available.
   const pendingCandidatesRef = useRef([]);
+
+  // Whether the remote description has been applied on the current peer
+  // connection. A ref (not state) so that the socket event handlers — which
+  // are registered once and close over this value — always read the latest
+  // value without stale-closure issues.
+  const remoteDescriptionSetRef = useRef(false);
+
+  // Whether this client created the room (i.e. is the offerer).
   const isRoomCreatorRef = useRef(false);
+
+  // Mirrors the activeRoom state so socket handlers (registered once) can
+  // always read the current room id without stale-closure issues.
+  const activeRoomRef = useRef("");
+
+  // Mirrors the socket instance so stable callbacks can access it without
+  // being listed as dependencies of the socket effect.
   const socketRef = useRef(null);
-  const activeRoomRef = useRef(null);
+
+  // ---------------------------------------------------------------------------
+  // WebRTC helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Drains all buffered ICE candidates into the peer connection.
+   * Must only be called after the remote description has been set.
+   */
+  const drainPendingCandidates = useCallback(async (pc) => {
+    while (pendingCandidatesRef.current.length > 0) {
+      const candidate = pendingCandidatesRef.current.shift();
+      try {
+        await addIceCandidate(pc, candidate);
+      } catch {
+        // A stale or invalid candidate from a previous session — safe to ignore.
+      }
+    }
+  }, []);
+
+  /**
+   * Creates the RTCPeerConnection, wires up callbacks, and stores it in the
+   * ref. Returns the existing connection if one is already active.
+   */
+  const setupPeerConnection = useCallback(() => {
+    if (peerConnectionRef.current) {
+      return peerConnectionRef.current;
+    }
+
+    const pc = createPeerConnection(
+      localStreamRef.current,
+      (candidate) => {
+        socketRef.current?.emit("webrtc-ice-candidate", {
+          roomId: activeRoomRef.current,
+          candidate,
+        });
+      },
+      (remoteStream) => {
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = remoteStream;
+          remoteVideoRef.current.play().catch(() => {
+            // Autoplay may be blocked; the user can tap the video to play.
+          });
+        }
+      },
+      (state) => {
+        setConnectionState(state);
+        if (state === "connected") {
+          setMessage("Video call connected!");
+        } else if (state === "failed" || state === "disconnected") {
+          setMessage("Video call connection failed.");
+        }
+      }
+    );
+
+    peerConnectionRef.current = pc;
+    return pc;
+  }, []);
+
+  /**
+   * Tears down the active peer connection and resets all related state.
+   */
+  const cleanupWebRTC = useCallback(() => {
+    if (peerConnectionRef.current) {
+      closePeerConnection(peerConnectionRef.current);
+      peerConnectionRef.current = null;
+    }
+    pendingCandidatesRef.current = [];
+    remoteDescriptionSetRef.current = false;
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = null;
+    }
+    setConnectionState("disconnected");
+  }, []);
+
+  /**
+   * Creates an offer using the current peer connection and sends it to the
+   * room. Expects setupPeerConnection() to have been called first.
+   */
+  const initiateWebRTCCall = useCallback(async () => {
+    const pc = setupPeerConnection();
+
+    try {
+      const offer = await createOffer(pc);
+      socketRef.current?.emit("webrtc-offer", {
+        roomId: activeRoomRef.current,
+        offer,
+      });
+      setConnectionState("connecting");
+      setMessage("Establishing WebRTC connection...");
+    } catch {
+      setMessage("Failed to initiate call.");
+    }
+  }, [setupPeerConnection]);
+
+  // ---------------------------------------------------------------------------
+  // Socket setup — registered once on mount
+  // ---------------------------------------------------------------------------
+
   useEffect(() => {
     const newSocket = io(SOCKET_URL);
+    socketRef.current = newSocket;
 
     newSocket.on("connect", () => {
       setConnected(true);
@@ -51,24 +167,20 @@ function VideoScreen() {
     newSocket.on("disconnect", () => {
       setConnected(false);
       setActiveRoom("");
+      activeRoomRef.current = "";
       setParticipantJoined(false);
       setMessage("Disconnected from server.");
     });
 
     newSocket.on("user-joined", ({ socketId }) => {
-      console.log("[VideoScreen] user-joined event received, socketId:", socketId);
-      console.log("[VideoScreen] isRoomCreator:", isRoomCreatorRef.current, "activeRoom:", activeRoomRef.current);
       setParticipantJoined(true);
       setMessage(`Another user joined the room: ${socketId}`);
-      
-      // If we created the room, initiate the WebRTC call
-      // Note: activeRoomRef.current might not be set yet due to React state batching
-      // Use the activeRoom state directly instead
+
+      // Only the room creator sends the initial offer.
+      // activeRoomRef is used here (not the activeRoom state) to avoid the
+      // stale-closure problem — the ref is always up-to-date.
       if (isRoomCreatorRef.current) {
-        console.log("[VideoScreen] Initiating WebRTC call as room creator");
         initiateWebRTCCall();
-      } else {
-        console.log("[VideoScreen] Not initiating call - isRoomCreator:", isRoomCreatorRef.current);
       }
     });
 
@@ -79,240 +191,155 @@ function VideoScreen() {
       cleanupWebRTC();
     });
 
-    // WebRTC signaling handlers
-    newSocket.on("webrtc-offer", async ({ offer, socketId }) => {
-      console.log("[VideoScreen] webrtc-offer received from:", socketId);
-      if (!peerConnectionRef.current) {
-        console.log("[VideoScreen] Creating peer connection for offer");
-        setupPeerConnection();
-      }
-      
-      // Check again after setupPeerConnection in case it failed
-      if (!peerConnectionRef.current) {
-        console.error("[VideoScreen] Failed to create peer connection for offer");
-        setMessage("Failed to establish connection - peer connection not available");
-        return;
-      }
+    // ------------------------------------------------------------------
+    // Answerer path: receive offer → set remote description → send answer
+    // ------------------------------------------------------------------
+    newSocket.on("webrtc-offer", async ({ offer }) => {
+      const pc = setupPeerConnection();
 
       try {
-        await createAnswer(peerConnectionRef.current, offer);
-        console.log("[VideoScreen] Answer created, sending to:", socketId);
-        newSocket.emit("webrtc-answer", { roomId: activeRoomRef.current, answer: peerConnectionRef.current.localDescription });
-        setRemoteDescriptionSet(true);
+        // createAnswer sets the remote description then the local description.
+        await createAnswer(pc, offer);
+        remoteDescriptionSetRef.current = true;
+
+        newSocket.emit("webrtc-answer", {
+          roomId: activeRoomRef.current,
+          answer: pc.localDescription,
+        });
+
         setConnectionState("connecting");
         setMessage("Establishing WebRTC connection...");
-      } catch (error) {
-        console.error("Error creating answer:", error);
+
+        // Drain any ICE candidates that arrived before the remote description.
+        await drainPendingCandidates(pc);
+      } catch {
         setMessage("Failed to establish connection.");
       }
     });
 
+    // ------------------------------------------------------------------
+    // Offerer path: receive answer → set remote description
+    // ------------------------------------------------------------------
     newSocket.on("webrtc-answer", async ({ answer }) => {
-      console.log("[VideoScreen] webrtc-answer received");
-      
-      if (!peerConnectionRef.current) {
-        console.error("[VideoScreen] Peer connection is null when receiving answer");
-        setMessage("Failed to establish connection - peer connection not available");
+      const pc = peerConnectionRef.current;
+      if (!pc) {
         return;
       }
 
       try {
-        await setRemoteDescription(peerConnectionRef.current, answer);
-        console.log("[VideoScreen] Remote description set");
-        setRemoteDescriptionSet(true);
+        await setRemoteDescription(pc, answer);
+        remoteDescriptionSetRef.current = true;
+
         setConnectionState("connecting");
         setMessage("Establishing WebRTC connection...");
-        
-        // Process queued ICE candidates now that remote description is set
-        while (pendingCandidatesRef.current.length > 0) {
-          const candidate = pendingCandidatesRef.current.shift();
-          try {
-            await addIceCandidate(peerConnectionRef.current, candidate);
-            console.log("[VideoScreen] Processed queued ICE candidate after remote description");
-          } catch (error) {
-            console.error("[VideoScreen] Error adding queued ICE candidate:", error);
-          }
-        }
-      } catch (error) {
-        console.error("Error setting remote description:", error);
+
+        // Drain any ICE candidates that arrived before the remote description.
+        await drainPendingCandidates(pc);
+      } catch {
         setMessage("Failed to establish connection.");
       }
     });
 
+    // ------------------------------------------------------------------
+    // ICE candidates — buffer until remote description is set
+    // ------------------------------------------------------------------
     newSocket.on("webrtc-ice-candidate", async ({ candidate }) => {
-      console.log("[VideoScreen] webrtc-ice-candidate received");
-      
-      if (!peerConnectionRef.current) {
-        // Queue candidates until peer connection is ready
-        console.log("[VideoScreen] Queuing ICE candidate (peer connection not ready)");
-        pendingCandidatesRef.current.push(candidate);
-        return;
-      }
-
-      // Queue candidates until remote description is set
-      if (!remoteDescriptionSet) {
-        console.log("[VideoScreen] Queuing ICE candidate (remote description not set)");
+      // remoteDescriptionSetRef and peerConnectionRef are refs, so this
+      // handler always reads their current values rather than stale closure
+      // values captured at registration time.
+      if (!peerConnectionRef.current || !remoteDescriptionSetRef.current) {
         pendingCandidatesRef.current.push(candidate);
         return;
       }
 
       try {
         await addIceCandidate(peerConnectionRef.current, candidate);
-        console.log("[VideoScreen] ICE candidate added");
-      } catch (error) {
-        console.error("Error adding ICE candidate:", error);
+      } catch {
+        // Stale or invalid candidate — safe to discard.
       }
     });
-
-    socketRef.current = newSocket;
-    setSocket(newSocket);
 
     return () => {
       newSocket.disconnect();
     };
-  }, []);
+  }, [initiateWebRTCCall, cleanupWebRTC, setupPeerConnection, drainPendingCandidates]);
 
-  const setupPeerConnection = () => {
-    // Allow peer connection creation even without local stream (receive-only mode)
-    console.log("[VideoScreen] Setting up peer connection, local stream:", !!localStreamRef.current);
-
-    const peerConnection = createPeerConnection(
-      localStreamRef.current,
-      (candidate) => {
-        socketRef.current?.emit("webrtc-ice-candidate", { roomId: activeRoomRef.current, candidate });
-      },
-      (remoteStream) => {
-        console.log("[VideoScreen] Received remote stream, tracks:", remoteStream.getTracks().length);
-        if (remoteVideoRef.current) {
-          console.log("[VideoScreen] Assigning stream to remote video element");
-          remoteVideoRef.current.srcObject = remoteStream;
-          // Attempt to play the video to handle autoplay restrictions
-          remoteVideoRef.current.play().catch(err => {
-            console.warn("[VideoScreen] Autoplay failed:", err);
-          });
-        } else {
-          console.log("[VideoScreen] remoteVideoRef.current is null, cannot assign stream");
-        }
-      },
-      (state) => {
-        console.log("[VideoScreen] Connection state changed to:", state);
-        setConnectionState(state);
-        if (state === "connected") {
-          setMessage("Video call connected!");
-        } else if (state === "failed" || state === "disconnected") {
-          setMessage("Video call connection failed.");
-        }
-      }
-    );
-
-    peerConnectionRef.current = peerConnection;
-    console.log("[VideoScreen] Peer connection created and stored in ref");
-
-    // Process any queued ICE candidates
-    while (pendingCandidatesRef.current.length > 0) {
-      const candidate = pendingCandidatesRef.current.shift();
-      addIceCandidate(peerConnection, candidate);
-      console.log("[VideoScreen] Processed queued ICE candidate");
-    }
-  };
-
-  const initiateWebRTCCall = async () => {
-    if (!peerConnectionRef.current) {
-      setupPeerConnection();
-    }
-
-    if (!peerConnectionRef.current) {
-      setMessage("Failed to setup peer connection.");
-      return;
-    }
-
-    try {
-      const offer = await createOffer(peerConnectionRef.current);
-      // Use activeRoom state directly instead of ref to avoid timing issues
-      const currentRoomId = activeRoom || activeRoomRef.current;
-      console.log("[VideoScreen] Sending webrtc-offer with roomId:", currentRoomId);
-      socketRef.current?.emit("webrtc-offer", { roomId: currentRoomId, offer });
-      setConnectionState("connecting");
-      setMessage("Establishing WebRTC connection...");
-    } catch (error) {
-      console.error("Error creating offer:", error);
-      setMessage("Failed to initiate call.");
-    }
-  };
-
-  const cleanupWebRTC = () => {
-    if (peerConnectionRef.current) {
-      closePeerConnection(peerConnectionRef.current);
-      peerConnectionRef.current = null;
-    }
-    pendingCandidatesRef.current = [];
-    setRemoteDescriptionSet(false);
-    if (remoteVideoRef.current) {
-      remoteVideoRef.current.srcObject = null;
-    }
-    setConnectionState("disconnected");
-  };
-
-  useEffect(() => {
-    activeRoomRef.current = activeRoom;
-  }, [activeRoom]);
+  // ---------------------------------------------------------------------------
+  // Media acquisition — runs when the user enters or changes a room
+  // ---------------------------------------------------------------------------
 
   useEffect(() => {
     if (!activeRoom) {
       return;
     }
 
+    // Keep the ref in sync with state so socket handlers always see the
+    // current room id.
+    activeRoomRef.current = activeRoom;
+
+    // Capture the video element reference at effect time for safe use in
+    // cleanup (the ref value may have changed by then).
+    const localVideoEl = localVideoRef.current;
+
     const acquireMedia = async () => {
       try {
         setMessage("Requesting camera and microphone...");
         const stream = await getMediaStream();
-        
+
         if (stream) {
           localStreamRef.current = stream;
-
+          setHasLocalStream(true);
           if (localVideoRef.current) {
             localVideoRef.current.srcObject = stream;
           }
-
           setMessage("Camera and microphone ready.");
         } else {
-          console.warn("[VideoScreen] No local stream available, will use receive-only mode");
           localStreamRef.current = null;
+          setHasLocalStream(false);
           setMessage("No camera/microphone available. You can still receive remote video.");
         }
       } catch (error) {
-        console.error("Failed to acquire media:", error);
-        setMessage(error.message || "Failed to access camera and microphone. You can still receive remote video.");
-        // Continue with WebRTC in receive-only mode
         localStreamRef.current = null;
+        setHasLocalStream(false);
+        setMessage(
+          error instanceof Error
+            ? error.message
+            : "Failed to access camera and microphone. You can still receive remote video."
+        );
       }
     };
 
     acquireMedia();
 
     return () => {
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = null;
+      if (localVideoEl) {
+        localVideoEl.srcObject = null;
       }
-
       if (localStreamRef.current) {
         stopMediaStream(localStreamRef.current);
         localStreamRef.current = null;
+        setHasLocalStream(false);
       }
       cleanupWebRTC();
     };
-  }, [activeRoom]);
+  }, [activeRoom, cleanupWebRTC]);
+
+  // ---------------------------------------------------------------------------
+  // Room actions
+  // ---------------------------------------------------------------------------
 
   const createRoom = () => {
-    if (!socket?.connected) {
+    const sock = socketRef.current;
+    if (!sock?.connected) {
       setMessage("Not connected to the server.");
       return;
     }
 
-    socket.emit("create-room", (response) => {
+    sock.emit("create-room", (response) => {
       if (response?.success) {
         setRoomId(response.roomId);
         setActiveRoom(response.roomId);
+        activeRoomRef.current = response.roomId;
         isRoomCreatorRef.current = true;
         setConnectionState("waiting");
         setMessage("Room created! Share the room ID with the other user.");
@@ -323,7 +350,8 @@ function VideoScreen() {
   };
 
   const joinRoom = () => {
-    if (!socket?.connected) {
+    const sock = socketRef.current;
+    if (!sock?.connected) {
       setMessage("Not connected to the server.");
       return;
     }
@@ -333,9 +361,10 @@ function VideoScreen() {
       return;
     }
 
-    socket.emit("join-room", roomId.trim(), (response) => {
+    sock.emit("join-room", roomId.trim(), (response) => {
       if (response?.success) {
         setActiveRoom(response.roomId);
+        activeRoomRef.current = response.roomId;
         isRoomCreatorRef.current = false;
         setConnectionState("waiting");
         setMessage("Joined room successfully! Waiting for WebRTC connection...");
@@ -348,13 +377,13 @@ function VideoScreen() {
   const leaveRoom = () => {
     cleanupWebRTC();
     isRoomCreatorRef.current = false;
-    
-    // Reset control states
     setIsMicMuted(false);
     setIsCameraOff(false);
 
-    if (!socket?.connected || !activeRoom) {
+    const sock = socketRef.current;
+    if (!sock?.connected || !activeRoom) {
       setActiveRoom("");
+      activeRoomRef.current = "";
       setParticipantJoined(false);
       setRoomId("");
       setMessage("Left the room. Create or join a new room.");
@@ -363,9 +392,10 @@ function VideoScreen() {
 
     const roomToLeave = activeRoom;
 
-    socket.emit("leave-room", roomToLeave, (response) => {
+    sock.emit("leave-room", roomToLeave, (response) => {
       if (response?.success) {
         setActiveRoom("");
+        activeRoomRef.current = "";
         setParticipantJoined(false);
         setRoomId("");
         setMessage("Left the room. Create or join a new room.");
@@ -375,15 +405,16 @@ function VideoScreen() {
     });
   };
 
+  // ---------------------------------------------------------------------------
+  // Media controls
+  // ---------------------------------------------------------------------------
+
   const toggleMic = () => {
-    if (!localStreamRef.current) {
-      console.warn("No local stream available to toggle microphone");
-      return;
-    }
+    if (!localStreamRef.current) return;
 
     const audioTracks = localStreamRef.current.getAudioTracks();
     if (audioTracks.length === 0) {
-      setMessage("No microphone track available in simulated mode.");
+      setMessage("No microphone track available.");
       return;
     }
 
@@ -391,16 +422,12 @@ function VideoScreen() {
     audioTracks.forEach((track) => {
       track.enabled = !newMutedState;
     });
-
     setIsMicMuted(newMutedState);
     setMessage(newMutedState ? "Microphone muted" : "Microphone unmuted");
   };
 
   const toggleCamera = () => {
-    if (!localStreamRef.current) {
-      console.warn("No local stream available to toggle camera");
-      return;
-    }
+    if (!localStreamRef.current) return;
 
     const videoTracks = localStreamRef.current.getVideoTracks();
     if (videoTracks.length === 0) {
@@ -412,15 +439,17 @@ function VideoScreen() {
     videoTracks.forEach((track) => {
       track.enabled = !newCameraState;
     });
-
     setIsCameraOff(newCameraState);
     setMessage(newCameraState ? "Camera turned off" : "Camera turned on");
   };
 
   const endCall = () => {
-    // Call existing leaveRoom logic (which resets control states)
     leaveRoom();
   };
+
+  // ---------------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------------
 
   if (!activeRoom) {
     return (
@@ -484,7 +513,7 @@ function VideoScreen() {
             muted
             className="video-element"
           />
-          <div className="video-label">{cameraLabel}</div>
+          <div className="video-label">{CAMERA_LABEL}</div>
         </div>
 
         <div className="video-wrapper">
@@ -534,7 +563,7 @@ function VideoScreen() {
             className={`control-button mic-button ${isMicMuted ? "muted" : ""}`}
             onClick={toggleMic}
             aria-label={isMicMuted ? "Unmute microphone" : "Mute microphone"}
-            disabled={!localStreamRef.current}
+            disabled={!hasLocalStream}
           >
             {isMicMuted ? "🎤 Unmute" : "🎤 Mute"}
           </button>
@@ -543,7 +572,7 @@ function VideoScreen() {
             className={`control-button camera-button ${isCameraOff ? "off" : ""}`}
             onClick={toggleCamera}
             aria-label={isCameraOff ? "Turn on camera" : "Turn off camera"}
-            disabled={!localStreamRef.current}
+            disabled={!hasLocalStream}
           >
             {isCameraOff ? "📷 On" : "📷 Off"}
           </button>

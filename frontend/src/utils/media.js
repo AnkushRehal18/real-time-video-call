@@ -49,7 +49,7 @@ export async function getMediaStream() {
       
       console.warn("[Media]", errorMessage);
       // Store error message in a way that can be retrieved by the component
-      throw new Error(errorMessage);
+      throw new Error(errorMessage, { cause: error });
     }
   } else {
     // Development mode: Use simulated camera

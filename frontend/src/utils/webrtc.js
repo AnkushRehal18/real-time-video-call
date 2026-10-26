@@ -19,19 +19,19 @@ function getIceServers() {
       username: turnUsername,
       credential: turnCredential,
     });
-    console.log("[WebRTC] TURN server configured");
   }
 
   return { iceServers };
 }
 
 /**
- * Creates and configures an RTCPeerConnection
- * @param {MediaStream} localStream - The local media stream to add to the connection
- * @param {Function} onIceCandidate - Callback when an ICE candidate is generated
- * @param {Function} onTrack - Callback when a remote track is received
- * @param {Function} onConnectionStateChange - Callback when connection state changes
- * @returns {RTCPeerConnection} The configured peer connection
+ * Creates and configures an RTCPeerConnection.
+ *
+ * @param {MediaStream|null} localStream - Local media stream to add to the connection.
+ * @param {Function} onIceCandidate - Called when an ICE candidate is generated.
+ * @param {Function} onTrack - Called with the remote MediaStream when tracks arrive.
+ * @param {Function} onConnectionStateChange - Called when connection/ICE state changes.
+ * @returns {RTCPeerConnection}
  */
 export function createPeerConnection(
   localStream,
@@ -41,72 +41,57 @@ export function createPeerConnection(
 ) {
   const peerConnection = new RTCPeerConnection(getIceServers());
 
-  // Add local stream tracks to the peer connection if available
+  // Add local stream tracks so the remote peer can receive our media.
   if (localStream) {
     localStream.getTracks().forEach((track) => {
       peerConnection.addTrack(track, localStream);
     });
-    console.log("[WebRTC] Added local tracks:", localStream.getTracks().length);
   } else {
-    // If no local stream, add transceivers to receive remote media
-    console.log("[WebRTC] No local stream, adding transceivers for receive-only");
-    peerConnection.addTransceiver("video");
-    peerConnection.addTransceiver("audio");
+    // No local stream: add recvonly transceivers so the SDP includes the
+    // correct media sections and we can still receive remote tracks.
+    peerConnection.addTransceiver("video", { direction: "recvonly" });
+    peerConnection.addTransceiver("audio", { direction: "recvonly" });
   }
 
-  // Handle ICE candidate generation
   peerConnection.onicecandidate = (event) => {
     if (event.candidate) {
-      console.log("[WebRTC] ICE candidate generated");
       onIceCandidate(event.candidate);
-    } else {
-      console.log("[WebRTC] ICE gathering complete");
     }
   };
 
-  // Handle incoming remote stream
+  // Use a single MediaStream for all incoming tracks so that replacing
+  // srcObject on the second ontrack event does not discard the first track.
+  // Both audio and video tracks end up in the same stream.
+  const remoteStream = new MediaStream();
   peerConnection.ontrack = (event) => {
-    console.log("[WebRTC] ontrack fired, streams:", event.streams.length, "track kind:", event.track.kind);
-    
-    // Handle both cases: when streams array is populated and when it's not
-    let remoteStream;
+    // Prefer the stream provided by the browser; fall back to the shared one.
     if (event.streams && event.streams.length > 0) {
-      remoteStream = event.streams[0];
-      console.log("[WebRTC] Remote stream from event.streams[0], tracks:", remoteStream.getTracks().length);
+      // The browser already groups both tracks into one stream. Notify the
+      // caller every time a new track arrives so the video element is
+      // (re-)assigned the stream containing the most up-to-date track list.
+      onTrack(event.streams[0]);
     } else {
-      // Create a new stream if none provided (some browsers do this)
-      remoteStream = new MediaStream();
       remoteStream.addTrack(event.track);
-      console.log("[WebRTC] Created new remote stream for track:", event.track.kind);
+      onTrack(remoteStream);
     }
-    
-    onTrack(remoteStream);
   };
 
-  // Handle connection state changes
   peerConnection.onconnectionstatechange = () => {
-    console.log("[WebRTC] Connection state changed:", peerConnection.connectionState);
     onConnectionStateChange(peerConnection.connectionState);
   };
 
-  // Handle ICE connection state changes
   peerConnection.oniceconnectionstatechange = () => {
-    console.log("[WebRTC] ICE connection state changed:", peerConnection.iceConnectionState);
     onConnectionStateChange(peerConnection.iceConnectionState);
-  };
-
-  // Handle signaling state changes
-  peerConnection.onsignalingstatechange = () => {
-    console.log("[WebRTC] Signaling state changed:", peerConnection.signalingState);
   };
 
   return peerConnection;
 }
 
 /**
- * Creates an offer for the peer connection
- * @param {RTCPeerConnection} peerConnection - The peer connection to create an offer for
- * @returns {Promise<RTCSessionDescriptionInit>} The session description
+ * Creates an offer and sets it as the local description.
+ *
+ * @param {RTCPeerConnection} peerConnection
+ * @returns {Promise<RTCSessionDescriptionInit>}
  */
 export async function createOffer(peerConnection) {
   const offer = await peerConnection.createOffer();
@@ -115,10 +100,12 @@ export async function createOffer(peerConnection) {
 }
 
 /**
- * Creates an answer for the peer connection
- * @param {RTCPeerConnection} peerConnection - The peer connection to create an answer for
- * @param {RTCSessionDescriptionInit} offer - The remote offer to answer
- * @returns {Promise<RTCSessionDescriptionInit>} The session description
+ * Applies a remote offer and creates an answer.
+ * Sets both the remote and local descriptions.
+ *
+ * @param {RTCPeerConnection} peerConnection
+ * @param {RTCSessionDescriptionInit} offer
+ * @returns {Promise<RTCSessionDescriptionInit>}
  */
 export async function createAnswer(peerConnection, offer) {
   await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
@@ -128,26 +115,31 @@ export async function createAnswer(peerConnection, offer) {
 }
 
 /**
- * Sets the remote description on the peer connection
- * @param {RTCPeerConnection} peerConnection - The peer connection
- * @param {RTCSessionDescriptionInit} description - The remote description
+ * Sets the remote description on the peer connection.
+ *
+ * @param {RTCPeerConnection} peerConnection
+ * @param {RTCSessionDescriptionInit} description
  */
 export async function setRemoteDescription(peerConnection, description) {
   await peerConnection.setRemoteDescription(new RTCSessionDescription(description));
 }
 
 /**
- * Adds an ICE candidate to the peer connection
- * @param {RTCPeerConnection} peerConnection - The peer connection
- * @param {RTCIceCandidateInit} candidate - The ICE candidate to add
+ * Adds an ICE candidate to the peer connection.
+ * Returns a promise so callers can handle errors.
+ *
+ * @param {RTCPeerConnection} peerConnection
+ * @param {RTCIceCandidateInit} candidate
+ * @returns {Promise<void>}
  */
 export function addIceCandidate(peerConnection, candidate) {
-  peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+  return peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
 }
 
 /**
- * Closes the peer connection and cleans up resources
- * @param {RTCPeerConnection} peerConnection - The peer connection to close
+ * Closes the peer connection and cleans up resources.
+ *
+ * @param {RTCPeerConnection} peerConnection
  */
 export function closePeerConnection(peerConnection) {
   if (peerConnection) {
