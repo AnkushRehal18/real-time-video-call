@@ -13,7 +13,7 @@ function getIceServers() {
   const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL;
 
   if (turnUrls && turnUsername && turnCredential) {
-    const urls = turnUrls.split(',').map(url => url.trim());
+    const urls = turnUrls.split(",").map((url) => url.trim());
     iceServers.push({
       urls,
       username: turnUsername,
@@ -31,60 +31,129 @@ function getIceServers() {
  * @param {Function} onIceCandidate - Called when an ICE candidate is generated.
  * @param {Function} onTrack - Called with the remote MediaStream when tracks arrive.
  * @param {Function} onConnectionStateChange - Called when connection/ICE state changes.
+ * @param {string} role - "offerer" or "answerer", used only for diagnostic logging.
  * @returns {RTCPeerConnection}
  */
 export function createPeerConnection(
   localStream,
   onIceCandidate,
   onTrack,
-  onConnectionStateChange
+  onConnectionStateChange,
+  role = "unknown"
 ) {
-  const peerConnection = new RTCPeerConnection(getIceServers());
+  const pc = new RTCPeerConnection(getIceServers());
 
-  // Add local stream tracks so the remote peer can receive our media.
+  // ── DIAGNOSTIC: log what tracks are being added ──────────────────────────
   if (localStream) {
-    localStream.getTracks().forEach((track) => {
-      peerConnection.addTrack(track, localStream);
+    const tracks = localStream.getTracks();
+    console.log(
+      `[WebRTC][${role}] createPeerConnection: adding ${tracks.length} local track(s):`,
+      tracks.map((t) => `${t.kind} enabled=${t.enabled} readyState=${t.readyState}`)
+    );
+    tracks.forEach((track) => {
+      pc.addTrack(track, localStream);
     });
   } else {
     // No local stream: add recvonly transceivers so the SDP includes the
     // correct media sections and we can still receive remote tracks.
-    peerConnection.addTransceiver("video", { direction: "recvonly" });
-    peerConnection.addTransceiver("audio", { direction: "recvonly" });
+    console.warn(
+      `[WebRTC][${role}] createPeerConnection: NO local stream — adding recvonly transceivers. ` +
+        "Remote side will NOT send media back to this peer."
+    );
+    pc.addTransceiver("video", { direction: "recvonly" });
+    pc.addTransceiver("audio", { direction: "recvonly" });
   }
 
-  peerConnection.onicecandidate = (event) => {
+  pc.onicecandidate = (event) => {
     if (event.candidate) {
-      onIceCandidate(event.candidate);
+      // Log safe metadata only — never the full candidate string
+      const c = event.candidate;
+      const parts =
+        typeof c.candidate === "string" ? c.candidate.split(" ") : [];
+      console.log(`[WebRTC][${role}] ICE candidate generated:`, {
+        sdpMid: c.sdpMid,
+        sdpMLineIndex: c.sdpMLineIndex,
+        protocol: parts[2] ?? null,
+        candidateType: parts[7] ?? null,
+      });
+      onIceCandidate(c);
+    } else {
+      console.log(`[WebRTC][${role}] ICE gathering complete (null candidate)`);
     }
+  };
+
+  pc.onicegatheringstatechange = () => {
+    console.log(
+      `[WebRTC][${role}] iceGatheringState →`,
+      pc.iceGatheringState
+    );
   };
 
   // Use a single MediaStream for all incoming tracks so that replacing
   // srcObject on the second ontrack event does not discard the first track.
   // Both audio and video tracks end up in the same stream.
   const remoteStream = new MediaStream();
-  peerConnection.ontrack = (event) => {
-    // Prefer the stream provided by the browser; fall back to the shared one.
+  pc.ontrack = (event) => {
+    // ── DIAGNOSTIC: confirm ontrack fires and what it carries ─────────────
+    const track = event.track;
+    const streamIds = event.streams.map((s) => s.id);
+    console.log(`[WebRTC][${role}] ontrack fired:`, {
+      kind: track.kind,
+      readyState: track.readyState,
+      enabled: track.enabled,
+      muted: track.muted,
+      streamCount: event.streams.length,
+      streamIds,
+    });
+
     if (event.streams && event.streams.length > 0) {
-      // The browser already groups both tracks into one stream. Notify the
-      // caller every time a new track arrives so the video element is
-      // (re-)assigned the stream containing the most up-to-date track list.
-      onTrack(event.streams[0]);
+      const stream = event.streams[0];
+      console.log(`[WebRTC][${role}] ontrack: assigning remote stream`, {
+        streamId: stream.id,
+        videoTracks: stream.getVideoTracks().length,
+        audioTracks: stream.getAudioTracks().length,
+      });
+      onTrack(stream);
     } else {
-      remoteStream.addTrack(event.track);
+      remoteStream.addTrack(track);
+      console.log(`[WebRTC][${role}] ontrack: added track to shared remoteStream`, {
+        videoTracks: remoteStream.getVideoTracks().length,
+        audioTracks: remoteStream.getAudioTracks().length,
+      });
       onTrack(remoteStream);
     }
   };
 
-  peerConnection.onconnectionstatechange = () => {
-    onConnectionStateChange(peerConnection.connectionState);
+  pc.onconnectionstatechange = () => {
+    console.log(
+      `[WebRTC][${role}] connectionState →`,
+      pc.connectionState
+    );
+    onConnectionStateChange(pc.connectionState);
   };
 
-  peerConnection.oniceconnectionstatechange = () => {
-    onConnectionStateChange(peerConnection.iceConnectionState);
+  pc.oniceconnectionstatechange = () => {
+    console.log(
+      `[WebRTC][${role}] iceConnectionState →`,
+      pc.iceConnectionState
+    );
+    // Only propagate states that map directly to RTCPeerConnection.connectionState
+    // values, so the UI state machine stays consistent. iceConnectionState
+    // "checking" and "completed" are intentionally not forwarded.
+    const ice = pc.iceConnectionState;
+    if (ice === "failed" || ice === "disconnected" || ice === "closed") {
+      onConnectionStateChange(ice);
+    }
   };
 
-  return peerConnection;
+  pc.onsignalingstatechange = () => {
+    console.log(
+      `[WebRTC][${role}] signalingState →`,
+      pc.signalingState
+    );
+  };
+
+  return pc;
 }
 
 /**
@@ -96,6 +165,11 @@ export function createPeerConnection(
 export async function createOffer(peerConnection) {
   const offer = await peerConnection.createOffer();
   await peerConnection.setLocalDescription(offer);
+  // Log safe structural metadata only — never the SDP string
+  console.log("[WebRTC][offerer] createOffer: local description set", {
+    type: offer.type,
+    mediaSections: (offer.sdp?.match(/^m=/gm) || []).length,
+  });
   return offer;
 }
 
@@ -109,8 +183,16 @@ export async function createOffer(peerConnection) {
  */
 export async function createAnswer(peerConnection, offer) {
   await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+  console.log("[WebRTC][answerer] createAnswer: remote description (offer) set", {
+    type: offer.type,
+    mediaSections: (offer.sdp?.match(/^m=/gm) || []).length,
+  });
   const answer = await peerConnection.createAnswer();
   await peerConnection.setLocalDescription(answer);
+  console.log("[WebRTC][answerer] createAnswer: local description (answer) set", {
+    type: answer.type,
+    mediaSections: (answer.sdp?.match(/^m=/gm) || []).length,
+  });
   return answer;
 }
 
@@ -121,7 +203,13 @@ export async function createAnswer(peerConnection, offer) {
  * @param {RTCSessionDescriptionInit} description
  */
 export async function setRemoteDescription(peerConnection, description) {
-  await peerConnection.setRemoteDescription(new RTCSessionDescription(description));
+  await peerConnection.setRemoteDescription(
+    new RTCSessionDescription(description)
+  );
+  console.log("[WebRTC][offerer] setRemoteDescription: remote description (answer) set", {
+    type: description.type,
+    mediaSections: (description.sdp?.match(/^m=/gm) || []).length,
+  });
 }
 
 /**
@@ -132,8 +220,8 @@ export async function setRemoteDescription(peerConnection, description) {
  * @param {RTCIceCandidateInit} candidate
  * @returns {Promise<void>}
  */
-export function addIceCandidate(peerConnection, candidate) {
-  return peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+export async function addIceCandidate(peerConnection, candidate) {
+  await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
 }
 
 /**
