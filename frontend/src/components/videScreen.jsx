@@ -54,27 +54,75 @@ function VideoScreen() {
   const socketRef = useRef(null);
 
   // ---------------------------------------------------------------------------
-  // FIX (Bug 1 + 2): Track media readiness so BOTH the offerer AND the answerer
-  // never create a peer connection before local tracks are available.
+  // Media-ready promise + generation counter
   //
-  // Problem: when the room creator receives "user-joined", initiateWebRTCCall()
-  // runs immediately. When the joiner receives "webrtc-offer", it also runs
-  // without waiting. In both cases getMediaStream() is async —
-  // localStreamRef.current may still be null at that point. createPeerConnection()
-  // then falls through to the recvonly transceiver path, producing a connection
-  // that carries no local video. The remote peer never receives video from the
-  // party that raced.
+  // mediaReadyRef    — Promise<MediaStream|null> that resolves when the current
+  //                    media acquisition attempt completes (success, failure, or
+  //                    null stream). Awaited by initiateWebRTCCall() and the
+  //                    webrtc-offer handler before creating a peer connection.
   //
-  // Fix: store a Promise that resolves when media acquisition completes (either
-  // with a stream or with null). Both initiateWebRTCCall() (offerer) and the
-  // webrtc-offer handler (answerer) await it before proceeding.
+  // mediaReadyResolveRef — resolver for that promise. Set when the promise is
+  //                    created, cleared immediately after first call to prevent
+  //                    double-resolve.
+  //
+  // mediaGenRef      — monotonically increasing integer. Incremented each time a
+  //                    new media acquisition starts (ensureMediaReadyPromise) and
+  //                    each time cleanupWebRTC invalidates the current session.
+  //                    acquireMedia captures its generation at start and checks it
+  //                    in the finally block: if the generation has changed, the
+  //                    acquisition belongs to a cancelled session and its result
+  //                    must not be applied. The same generation check in
+  //                    initiateWebRTCCall / webrtc-offer handler prevents a
+  //                    cancelled call from creating a new peer connection after
+  //                    the await returns.
   // ---------------------------------------------------------------------------
-  const mediaReadyRef = useRef(null);       // Promise<MediaStream|null>
+  const mediaReadyRef = useRef(null);        // Promise<MediaStream|null>
   const mediaReadyResolveRef = useRef(null); // resolver fn for that Promise
+  const mediaGenRef = useRef(0);             // cancellation generation counter
 
   // ---------------------------------------------------------------------------
   // WebRTC helpers
   // ---------------------------------------------------------------------------
+
+  /**
+   * Ensures a media-ready promise exists for the current session.
+   * Idempotent — safe to call multiple times; only creates a new promise when
+   * the current one has been cleared (by cleanupWebRTC or never set).
+   * Always increments the generation counter so that any in-flight
+   * acquireMedia() from a previous session is invalidated.
+   *
+   * Called from createRoom(), joinRoom(), and the reconnect handler so that
+   * EVERY entry point into a session creates the promise before signaling
+   * can start.
+   *
+   * @param {string} caller - Label for diagnostic logging.
+   */
+  const ensureMediaReadyPromise = useCallback((caller) => {
+    // Increment generation unconditionally. Even if a promise already exists
+    // (re-entering the same session), a new generation invalidates any
+    // acquireMedia() that may still be running from a prior call.
+    mediaGenRef.current += 1;
+    const gen = mediaGenRef.current;
+
+    if (!mediaReadyRef.current) {
+      let resolve;
+      mediaReadyRef.current = new Promise((res) => { resolve = res; });
+      mediaReadyResolveRef.current = resolve;
+      console.log("[LocalMedia] media-ready promise created", {
+        caller,
+        generation: gen,
+        timestamp: new Date().toISOString(),
+      });
+    } else {
+      // Promise already exists — a prior call to this function (or the media
+      // useEffect) created it. Log the generation bump but keep the promise.
+      console.log("[LocalMedia] media-ready promise already exists, generation bumped", {
+        caller,
+        generation: gen,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }, []);
 
   /**
    * Drains all buffered ICE candidates into the peer connection.
@@ -103,10 +151,8 @@ function VideoScreen() {
    * Creates the RTCPeerConnection, wires up callbacks, and stores it in the
    * ref. Returns the existing connection if one is already active.
    *
-   * IMPORTANT: must only be called after localStreamRef.current is settled
-   * (either a valid stream or confirmed null). Use initiateWebRTCCall() for
-   * the offerer path and always await mediaReadyRef first for the answerer
-   * path — both paths now correctly wait for media.
+   * Must only be called after awaiting the media-ready promise so that
+   * localStreamRef.current is always settled (stream or confirmed null).
    */
   const setupPeerConnection = useCallback(() => {
     if (peerConnectionRef.current) {
@@ -172,7 +218,7 @@ function VideoScreen() {
         setConnectionState(state);
         if (state === "connected") {
           setMessage("Video call connected!");
-          // Double-check remote video element dimensions when connected
+          // Double-check remote video element dimensions when connected.
           setTimeout(() => {
             const el = remoteVideoRef.current;
             if (el) {
@@ -198,18 +244,51 @@ function VideoScreen() {
 
   /**
    * Tears down the active peer connection and resets all related state.
+   *
+   * Increments mediaGenRef to invalidate any in-flight acquireMedia() or
+   * initiateWebRTCCall() that is currently awaiting the media-ready promise.
+   * Those calls check the generation after the await and abort if it has
+   * changed, preventing a cancelled session from creating a new peer
+   * connection or emitting a stale offer.
+   *
+   * Does NOT stop the local media stream — that is the responsibility of the
+   * media useEffect cleanup, which manages stream lifecycle separately.
+   *
+   * @param {string} [reason] - Human-readable reason for diagnostic logging.
    */
-  const cleanupWebRTC = useCallback(() => {
+  const cleanupWebRTC = useCallback((reason = "unspecified") => {
+    // Bump the generation so any in-flight acquireMedia or initiateWebRTCCall
+    // that is still awaiting mediaReadyRef knows it belongs to a dead session.
+    mediaGenRef.current += 1;
+    const gen = mediaGenRef.current;
+
+    console.log("[WebRTC] cleanupWebRTC called", {
+      reason,
+      roomId: activeRoomRef.current || "(none)",
+      hasPeerConnection: !!peerConnectionRef.current,
+      newGeneration: gen,
+      timestamp: new Date().toISOString(),
+    });
+
     if (peerConnectionRef.current) {
-      console.log("[WebRTC] cleanupWebRTC: closing peer connection");
       closePeerConnection(peerConnectionRef.current);
       peerConnectionRef.current = null;
     }
+
     pendingCandidatesRef.current = [];
     remoteDescriptionSetRef.current = false;
-    // FIX (Bug 4): Reset media-ready promise so a re-join gets a fresh promise
-    // rather than awaiting a promise that resolved for a previous session.
+
+    // Resolve the outstanding promise with null so that any caller currently
+    // awaiting it unblocks immediately rather than hanging forever. The
+    // generation check that follows the await in each caller will then abort
+    // the operation safely.
+    const resolve = mediaReadyResolveRef.current;
+    if (resolve) {
+      resolve(null); // unblock any awaiter
+      mediaReadyResolveRef.current = null;
+    }
     mediaReadyRef.current = null;
+
     if (remoteVideoRef.current) {
       remoteVideoRef.current.srcObject = null;
     }
@@ -217,27 +296,47 @@ function VideoScreen() {
   }, []);
 
   /**
-   * Creates an offer using the current peer connection and sends it to the
-   * room.
+   * Awaits the current media-ready promise, then creates an offer and sends it.
    *
-   * Awaits mediaReadyRef before creating the peer connection so that
-   * localStreamRef.current is always settled (stream or null) by the time
-   * createPeerConnection() is called. This prevents the offerer from
-   * accidentally creating a recvonly offer when media acquisition is still
-   * in progress.
+   * Uses the generation counter to detect if the session was cancelled while
+   * waiting for media. If the generation changed, the offer is not sent and
+   * the function returns silently — no peer connection is created for the
+   * dead session.
    */
   const initiateWebRTCCall = useCallback(async () => {
+    // Capture the generation at the start of this call attempt.
+    const callGen = mediaGenRef.current;
+
     console.log("[WebRTC] initiateWebRTCCall: waiting for media to be ready...", {
+      generation: callGen,
+      mediaReadyPromiseExists: !!mediaReadyRef.current,
       timestamp: new Date().toISOString(),
     });
 
-    // Await the media promise so we never race against getMediaStream()
+    // Always await the media promise. If it is null here we have a code path
+    // that did not call ensureMediaReadyPromise() first — log a warning and
+    // proceed; localStreamRef.current reflects current state.
     if (mediaReadyRef.current) {
       await mediaReadyRef.current;
+    } else {
+      console.warn("[WebRTC] initiateWebRTCCall: mediaReadyRef is null — ensureMediaReadyPromise() was not called before this path. Proceeding with current stream state.", {
+        generation: callGen,
+        streamPresent: !!localStreamRef.current,
+      });
+    }
+
+    // After the await, check if this call attempt is still valid.
+    if (mediaGenRef.current !== callGen) {
+      console.log("[WebRTC] initiateWebRTCCall: session cancelled during media wait, aborting", {
+        capturedGeneration: callGen,
+        currentGeneration: mediaGenRef.current,
+      });
+      return;
     }
 
     console.log("[LocalMedia] initiateWebRTCCall: media ready", {
-      present: !!localStreamRef.current,
+      generation: callGen,
+      streamPresent: !!localStreamRef.current,
       tracks: localStreamRef.current?.getTracks().map((t) => ({
         kind: t.kind,
         enabled: t.enabled,
@@ -251,10 +350,21 @@ function VideoScreen() {
       const offer = await createOffer(pc);
       const sock = socketRef.current;
       const room = activeRoomRef.current;
+
+      // Check generation again after the async createOffer call.
+      if (mediaGenRef.current !== callGen) {
+        console.log("[WebRTC] initiateWebRTCCall: session cancelled during createOffer, aborting", {
+          capturedGeneration: callGen,
+          currentGeneration: mediaGenRef.current,
+        });
+        return;
+      }
+
       console.log("[WebRTC] offer emitting", {
         roomId: room,
         socketConnected: !!sock?.connected,
         signalingState: pc.signalingState,
+        generation: callGen,
       });
       sock?.emit("webrtc-offer", {
         roomId: room,
@@ -285,13 +395,24 @@ function VideoScreen() {
     socketRef.current = newSocket;
 
     newSocket.on("connect", () => {
+      const transport = newSocket.io?.engine?.transport?.name ?? "unknown";
       console.log("[Socket.IO] connected", {
         id: newSocket.id,
-        transport: newSocket.io?.engine?.transport?.name,
+        transport,
         timestamp: new Date().toISOString(),
       });
       setConnected(true);
       setMessage("Connected to server. Create or join a room.");
+
+      // Log transport upgrades after initial connection so we can distinguish
+      // websocket from long-poll in production without having to check DevTools.
+      newSocket.io?.engine?.on("upgrade", (newTransport) => {
+        console.log("[Socket.IO] transport upgraded", {
+          from: transport,
+          to: newTransport?.name ?? "unknown",
+          timestamp: new Date().toISOString(),
+        });
+      });
     });
 
     newSocket.on("connect_error", (error) => {
@@ -312,8 +433,8 @@ function VideoScreen() {
       setConnected(false);
 
       // Only clear room state for deliberate disconnects. For ping timeout /
-      // transport close the socket will auto-reconnect — we keep the room
-      // state so reconnect handler can rejoin.
+      // transport close the socket will auto-reconnect — keep room state so
+      // the reconnect handler can rejoin.
       if (reason === "io server disconnect" || reason === "io client disconnect") {
         setActiveRoom("");
         activeRoomRef.current = "";
@@ -324,56 +445,87 @@ function VideoScreen() {
       }
     });
 
-    // FIX (Bug 6): Reconnect handler. After a ping timeout or transport close
-    // Socket.IO auto-reconnects, but the server-side rooms are empty again.
-    // We must re-emit join-room so signaling can resume.
+    // After a ping-timeout or transport-close the socket auto-reconnects but
+    // the server-side room membership is gone. Re-join and re-initiate if we
+    // were the offerer.
     newSocket.on("reconnect", (attemptNumber) => {
+      const transport = newSocket.io?.engine?.transport?.name ?? "unknown";
       console.log("[Socket.IO] reconnected", {
         attemptNumber,
         id: newSocket.id,
-        transport: newSocket.io?.engine?.transport?.name,
+        transport,
         timestamp: new Date().toISOString(),
       });
       setConnected(true);
 
       const room = activeRoomRef.current;
-      if (room) {
-        console.log("[Socket.IO] re-joining room after reconnect:", room);
-        setMessage("Reconnected — rejoining room...");
-
-        newSocket.emit("join-room", room, (response) => {
-          if (response?.success) {
-            console.log("[Socket.IO] room rejoined successfully after reconnect:", room);
-            setMessage("Rejoined room. Waiting for peer...");
-
-            // If we were the room creator, re-initiate the WebRTC offer.
-            // The peer connection would have been cleaned up on disconnect.
-            if (isRoomCreatorRef.current && !peerConnectionRef.current) {
-              console.log("[WebRTC] re-initiating call after reconnect (we are the offerer)");
-              initiateWebRTCCall();
-            }
-          } else {
-            console.warn("[Socket.IO] failed to rejoin room after reconnect:", response?.message);
-            setMessage(response?.message || "Could not rejoin room after reconnect.");
-            // Room may have expired — clear room state so user can start fresh.
-            setActiveRoom("");
-            activeRoomRef.current = "";
-            setParticipantJoined(false);
-          }
-        });
+      if (!room) {
+        console.log("[Socket.IO] reconnect: no active room to rejoin");
+        return;
       }
+
+      console.log("[Socket.IO] re-joining room after reconnect", { room });
+      setMessage("Reconnected — rejoining room...");
+
+      // Pre-create the media-ready promise before emitting join-room.
+      // If the stream is still alive this promise will be resolved immediately
+      // by the media useEffect (which didn't run because activeRoom didn't
+      // change). If cleanupWebRTC was called between disconnect and reconnect,
+      // it will be resolved when acquireMedia() finishes after the re-render.
+      ensureMediaReadyPromise("reconnect");
+
+      newSocket.emit("join-room", room, (response) => {
+        if (response?.success) {
+          console.log("[Socket.IO] room rejoined after reconnect", {
+            room,
+            attemptNumber,
+          });
+          setMessage("Rejoined room. Waiting for peer...");
+
+          // Only re-initiate the offer if we were the original offerer and
+          // there is no existing peer connection (avoid duplicate offers).
+          if (isRoomCreatorRef.current && !peerConnectionRef.current) {
+            console.log("[WebRTC] re-initiating call after reconnect (offerer, no existing PC)");
+            initiateWebRTCCall();
+          } else if (peerConnectionRef.current) {
+            console.log("[WebRTC] reconnect: existing PC still active, not re-initiating", {
+              signalingState: peerConnectionRef.current.signalingState,
+              connectionState: peerConnectionRef.current.connectionState,
+            });
+          }
+        } else {
+          // Room no longer exists — clear local state so the user can start fresh.
+          // Capture the current room before clearing so the log is meaningful.
+          const expiredRoom = activeRoomRef.current;
+          console.warn("[Socket.IO] failed to rejoin room after reconnect — room may have expired", {
+            room: expiredRoom,
+            serverMessage: response?.message,
+          });
+          setActiveRoom("");
+          activeRoomRef.current = "";
+          setParticipantJoined(false);
+          setMessage(response?.message || "Could not rejoin room — it may have expired. Please create a new room.");
+        }
+      });
     });
 
     newSocket.on("reconnect_attempt", (attemptNumber) => {
-      console.log("[Socket.IO] reconnect_attempt", { attemptNumber, timestamp: new Date().toISOString() });
+      console.log("[Socket.IO] reconnect_attempt", {
+        attemptNumber,
+        timestamp: new Date().toISOString(),
+      });
     });
 
     newSocket.on("reconnect_error", (err) => {
-      console.error("[Socket.IO] reconnect_error:", err.message);
+      console.error("[Socket.IO] reconnect_error:", err.message, {
+        timestamp: new Date().toISOString(),
+      });
     });
 
     newSocket.on("reconnect_failed", () => {
-      console.error("[Socket.IO] reconnect_failed — all retries exhausted");
+      console.error("[Socket.IO] reconnect_failed — all retries exhausted", {
+        timestamp: new Date().toISOString(),
+      });
       setMessage("Failed to reconnect to server. Please refresh.");
     });
 
@@ -388,44 +540,68 @@ function VideoScreen() {
       setMessage(`Another user joined the room: ${socketId}`);
 
       // Only the room creator sends the initial offer.
-      // activeRoomRef is used here (not the activeRoom state) to avoid the
-      // stale-closure problem — the ref is always up-to-date.
       if (isRoomCreatorRef.current) {
         initiateWebRTCCall();
       }
     });
 
     newSocket.on("user-left", ({ socketId }) => {
-      console.log("[Socket.IO] user-left", { socketId, timestamp: new Date().toISOString() });
+      console.log("[Socket.IO] user-left", {
+        socketId,
+        timestamp: new Date().toISOString(),
+      });
       setParticipantJoined(false);
-      setConnectionState("disconnected");
       setMessage(`Participant ${socketId} left the room.`);
-      cleanupWebRTC();
+      cleanupWebRTC("user-left event");
     });
 
     // ------------------------------------------------------------------
-    // Answerer path: receive offer → set remote description → send answer
-    // FIX (Bug 2): await mediaReadyRef BEFORE setupPeerConnection() so that
-    // localStreamRef.current is always settled when the PC is created.
-    // Without this await the answerer may race against getMediaStream() and
-    // create recvonly transceivers, sending no video to the offerer.
+    // Answerer path: receive offer → await media → create answer
     // ------------------------------------------------------------------
     newSocket.on("webrtc-offer", async ({ offer }) => {
+      // Capture generation before any async work.
+      const callGen = mediaGenRef.current;
       const room = activeRoomRef.current;
-      console.log("[WebRTC] offer received — waiting for local media before proceeding", {
+
+      console.log("[WebRTC] offer received", {
         roomId: room,
         socketConnected: newSocket.connected,
+        mediaReadyPromiseExists: !!mediaReadyRef.current,
+        generation: callGen,
         timestamp: new Date().toISOString(),
       });
 
-      // Wait for media acquisition to complete before creating the peer
-      // connection. This is the critical fix for the answerer path.
-      if (mediaReadyRef.current) {
+      if (!mediaReadyRef.current) {
+        // The offer arrived before any call path created the promise.
+        // This should not happen with the current pre-creation logic but is
+        // logged as a warning so it's visible in production if it does.
+        console.warn("[WebRTC] offer arrived but mediaReadyRef is null — proceeding with current stream state (no wait). This indicates ensureMediaReadyPromise() was not called before this offer arrived.", {
+          generation: callGen,
+          streamPresent: !!localStreamRef.current,
+        });
+      } else {
+        console.log("[WebRTC] awaiting media-ready promise before creating PC...", {
+          generation: callGen,
+        });
         await mediaReadyRef.current;
+        console.log("[WebRTC] media-ready promise resolved", {
+          generation: callGen,
+          streamPresent: !!localStreamRef.current,
+        });
       }
 
-      console.log("[LocalMedia] answerer: media ready before creating PC", {
-        present: !!localStreamRef.current,
+      // After the await, verify the session is still valid.
+      if (mediaGenRef.current !== callGen) {
+        console.log("[WebRTC] offer handler: session cancelled during media wait, aborting", {
+          capturedGeneration: callGen,
+          currentGeneration: mediaGenRef.current,
+        });
+        return;
+      }
+
+      console.log("[LocalMedia] answerer: media settled before creating PC", {
+        generation: callGen,
+        streamPresent: !!localStreamRef.current,
         tracks: localStreamRef.current?.getTracks().map((t) => ({
           kind: t.kind,
           enabled: t.enabled,
@@ -439,22 +615,33 @@ function VideoScreen() {
         console.log("[WebRTC] setRemoteDescription (offer) starting", {
           signalingState: pc.signalingState,
         });
-        // createAnswer sets the remote description then the local description.
         await createAnswer(pc, offer);
         remoteDescriptionSetRef.current = true;
-        console.log("[WebRTC] answer created and local description set, remoteDescriptionSet=true", {
+        console.log("[WebRTC] answer created and local description set", {
           signalingState: pc.signalingState,
         });
 
+        // Read the room ref again after the async createAnswer call — it may
+        // have changed if the session was torn down mid-negotiation.
+        const currentRoom = activeRoomRef.current;
+        if (mediaGenRef.current !== callGen) {
+          console.log("[WebRTC] offer handler: session cancelled during createAnswer, aborting", {
+            capturedGeneration: callGen,
+            currentGeneration: mediaGenRef.current,
+          });
+          return;
+        }
+
         const answer = pc.localDescription;
-        console.log("[WebRTC] answer emitting to room", room, {
+        console.log("[WebRTC] answer emitting to room", currentRoom, {
           socketConnected: newSocket.connected,
+          generation: callGen,
         });
         newSocket.emit("webrtc-answer", {
-          roomId: room,
+          roomId: currentRoom,
           answer,
         });
-        console.log("[WebRTC] answer emitted to room", room);
+        console.log("[WebRTC] answer emitted");
 
         setConnectionState("connecting");
         setMessage("Establishing WebRTC connection...");
@@ -488,14 +675,13 @@ function VideoScreen() {
         });
         await setRemoteDescription(pc, answer);
         remoteDescriptionSetRef.current = true;
-        console.log("[WebRTC] remote description (answer) set, remoteDescriptionSet=true", {
+        console.log("[WebRTC] remote description (answer) set", {
           signalingState: pc.signalingState,
         });
 
         setConnectionState("connecting");
         setMessage("Establishing WebRTC connection...");
 
-        // Drain any ICE candidates that arrived before the remote description.
         await drainPendingCandidates(pc);
       } catch (err) {
         console.error("[WebRTC] webrtc-answer handler error:", err.message, err.stack);
@@ -507,9 +693,6 @@ function VideoScreen() {
     // ICE candidates — buffer until remote description is set
     // ------------------------------------------------------------------
     newSocket.on("webrtc-ice-candidate", async ({ candidate }) => {
-      // remoteDescriptionSetRef and peerConnectionRef are refs, so this
-      // handler always reads their current values rather than stale closure
-      // values captured at registration time.
       if (!peerConnectionRef.current || !remoteDescriptionSetRef.current) {
         console.log("[WebRTC] ICE candidate buffered (remoteDesc not set yet)", {
           queueLength: pendingCandidatesRef.current.length + 1,
@@ -533,16 +716,15 @@ function VideoScreen() {
       console.log("[Socket.IO] disconnecting socket on unmount");
       newSocket.disconnect();
     };
-    // FIX (Bug 1): Empty dependency array — this effect must run exactly ONCE
-    // on mount. All callbacks use refs (socketRef, activeRoomRef, etc.) to
-    // access current values, so stale closures are not a concern. Having
-    // function references in this dep array caused the socket to be torn down
-    // and recreated on every render cycle, disconnecting peers mid-call.
+    // Empty dependency array — this effect runs exactly once on mount.
+    // All callbacks access current values through refs; stale closures are
+    // not a concern. Adding function references here would recreate the socket
+    // on every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ---------------------------------------------------------------------------
-  // Media acquisition — runs when the user enters or changes a room
+  // Media acquisition — runs when the user enters a room
   // ---------------------------------------------------------------------------
 
   useEffect(() => {
@@ -550,31 +732,46 @@ function VideoScreen() {
       return;
     }
 
-    // Keep the ref in sync with state so socket handlers always see the
+    // Keep the ref in sync with state so socket handlers always read the
     // current room id.
     activeRoomRef.current = activeRoom;
 
-    // Capture the video element reference at effect time for safe use in
-    // cleanup (the ref value may have changed by then).
+    // Capture the video element reference for safe use in cleanup — the ref
+    // value may have changed by the time cleanup runs.
     const localVideoEl = localVideoRef.current;
 
-    // Create a new media-ready promise for this room session.
-    // Both initiateWebRTCCall() (offerer) and the webrtc-offer handler
-    // (answerer) await this before creating the peer connection.
-    let resolveMediaReady;
-    mediaReadyRef.current = new Promise((resolve) => {
-      resolveMediaReady = resolve;
-    });
-    mediaReadyResolveRef.current = resolveMediaReady;
+    // Ensure a media-ready promise exists for this session. If createRoom() or
+    // joinRoom() already called ensureMediaReadyPromise(), this is a no-op
+    // for the promise itself but still bumps the generation, ensuring that any
+    // in-flight acquireMedia() from a previous session is invalidated.
+    ensureMediaReadyPromise("media useEffect");
+
+    // Capture the generation that this particular acquireMedia() call belongs to.
+    const acquireGen = mediaGenRef.current;
 
     const acquireMedia = async () => {
       console.log("[LocalMedia] acquiring media stream...", {
         room: activeRoom,
+        generation: acquireGen,
         timestamp: new Date().toISOString(),
       });
       try {
         setMessage("Requesting camera and microphone...");
         const stream = await getMediaStream();
+
+        // Check generation before applying any results — cleanup may have run
+        // while getUserMedia() was in progress (e.g., participant left).
+        if (mediaGenRef.current !== acquireGen) {
+          console.log("[LocalMedia] acquireMedia: session cancelled during getUserMedia, discarding result", {
+            capturedGeneration: acquireGen,
+            currentGeneration: mediaGenRef.current,
+          });
+          // Stop the stream immediately — it belongs to a dead session.
+          if (stream) {
+            stream.getTracks().forEach((t) => t.stop());
+          }
+          return;
+        }
 
         if (stream) {
           localStreamRef.current = stream;
@@ -584,6 +781,7 @@ function VideoScreen() {
           }
           setMessage("Camera and microphone ready.");
           console.log("[LocalMedia] stream acquired successfully", {
+            generation: acquireGen,
             tracks: stream.getTracks().map((t) => ({
               kind: t.kind,
               enabled: t.enabled,
@@ -594,23 +792,51 @@ function VideoScreen() {
           localStreamRef.current = null;
           setHasLocalStream(false);
           setMessage("No camera/microphone available. You can still receive remote video.");
-          console.warn("[LocalMedia] getMediaStream() returned null — receive-only mode");
+          console.warn("[LocalMedia] getMediaStream() returned null — receive-only mode", {
+            generation: acquireGen,
+          });
         }
       } catch (error) {
+        if (mediaGenRef.current !== acquireGen) {
+          console.log("[LocalMedia] acquireMedia: session cancelled, discarding error", {
+            capturedGeneration: acquireGen,
+            currentGeneration: mediaGenRef.current,
+          });
+          return;
+        }
         localStreamRef.current = null;
         setHasLocalStream(false);
-        console.error("[LocalMedia] media acquisition failed:", error.message);
+        console.error("[LocalMedia] media acquisition failed:", {
+          generation: acquireGen,
+          message: error.message,
+        });
         setMessage(
           error instanceof Error
             ? error.message
             : "Failed to access camera and microphone. You can still receive remote video."
         );
       } finally {
-        // Always resolve so both offerer and answerer are never blocked indefinitely.
-        resolveMediaReady(localStreamRef.current);
-        console.log("[LocalMedia] mediaReady promise resolved", {
-          streamPresent: !!localStreamRef.current,
-        });
+        // Resolve the media-ready promise if this acquisition still owns it.
+        // If cleanupWebRTC() ran concurrently, it already resolved the promise
+        // with null and cleared mediaReadyResolveRef — the null check here
+        // prevents a double-resolve and ensures we only settle the promise
+        // that belongs to this generation.
+        if (mediaGenRef.current === acquireGen) {
+          const resolve = mediaReadyResolveRef.current;
+          if (resolve) {
+            resolve(localStreamRef.current);
+            mediaReadyResolveRef.current = null;
+          }
+          console.log("[LocalMedia] mediaReady promise resolved", {
+            generation: acquireGen,
+            streamPresent: !!localStreamRef.current,
+          });
+        } else {
+          console.log("[LocalMedia] acquireMedia finally: generation mismatch, promise already settled by cleanup", {
+            capturedGeneration: acquireGen,
+            currentGeneration: mediaGenRef.current,
+          });
+        }
       }
     };
 
@@ -625,9 +851,9 @@ function VideoScreen() {
         localStreamRef.current = null;
         setHasLocalStream(false);
       }
-      cleanupWebRTC();
+      cleanupWebRTC("media useEffect cleanup (activeRoom changed or unmount)");
     };
-  }, [activeRoom, cleanupWebRTC]);
+  }, [activeRoom, cleanupWebRTC, ensureMediaReadyPromise]);
 
   // ---------------------------------------------------------------------------
   // Room actions
@@ -645,7 +871,15 @@ function VideoScreen() {
         console.log("[Socket.IO] room created", {
           roomId: response.roomId,
           isRoomCreator: true,
+          timestamp: new Date().toISOString(),
         });
+
+        // Pre-create the media-ready promise before setActiveRoom() triggers
+        // the re-render + media useEffect. user-joined can fire quickly once
+        // the other peer joins, and initiateWebRTCCall() must always find the
+        // promise in place. This mirrors the equivalent fix in joinRoom().
+        ensureMediaReadyPromise("createRoom");
+
         setRoomId(response.roomId);
         setActiveRoom(response.roomId);
         activeRoomRef.current = response.roomId;
@@ -675,7 +909,19 @@ function VideoScreen() {
         console.log("[Socket.IO] room joined", {
           roomId: response.roomId,
           isRoomCreator: false,
+          timestamp: new Date().toISOString(),
         });
+
+        // Pre-create the media-ready promise HERE, synchronously in the join
+        // callback, before setActiveRoom() triggers the React re-render and
+        // media useEffect. The webrtc-offer event can arrive from the server
+        // within milliseconds of this callback — before the media useEffect
+        // has had a chance to run. If mediaReadyRef.current is still null at
+        // that point, the offer handler's await is skipped and
+        // setupPeerConnection() runs with a null stream (recvonly PC). Pre-
+        // creating the promise here closes that window.
+        ensureMediaReadyPromise("joinRoom");
+
         setActiveRoom(response.roomId);
         activeRoomRef.current = response.roomId;
         isRoomCreatorRef.current = false;
@@ -688,33 +934,37 @@ function VideoScreen() {
   };
 
   const leaveRoom = () => {
-    cleanupWebRTC();
+    cleanupWebRTC("leaveRoom / endCall");
     isRoomCreatorRef.current = false;
     setIsMicMuted(false);
     setIsCameraOff(false);
 
     const sock = socketRef.current;
-    if (!sock?.connected || !activeRoom) {
-      setActiveRoom("");
-      activeRoomRef.current = "";
-      setParticipantJoined(false);
-      setRoomId("");
-      setMessage("Left the room. Create or join a new room.");
+    const roomToLeave = activeRoom;
+
+    // Clear local room state immediately so the UI transitions away regardless
+    // of whether the server-side leave-room acknowledgment arrives.
+    setActiveRoom("");
+    activeRoomRef.current = "";
+    setParticipantJoined(false);
+    setRoomId("");
+    setMessage("Left the room. Create or join a new room.");
+
+    if (!sock?.connected || !roomToLeave) {
       return;
     }
 
-    const roomToLeave = activeRoom;
-
     sock.emit("leave-room", roomToLeave, (response) => {
       if (response?.success) {
-        console.log("[Socket.IO] left room", roomToLeave);
-        setActiveRoom("");
-        activeRoomRef.current = "";
-        setParticipantJoined(false);
-        setRoomId("");
-        setMessage("Left the room. Create or join a new room.");
+        console.log("[Socket.IO] left room", {
+          room: roomToLeave,
+          timestamp: new Date().toISOString(),
+        });
       } else {
-        setMessage(response?.message || "Could not leave room.");
+        // Room state is already cleared — this is informational only.
+        console.warn("[Socket.IO] leave-room server response:", response?.message, {
+          room: roomToLeave,
+        });
       }
     });
   };
@@ -830,11 +1080,10 @@ function VideoScreen() {
           <div className="video-label">{CAMERA_LABEL}</div>
         </div>
 
-        {/* FIX (Bug 5): The remote video element is ALWAYS present in the DOM.
-            Previously display:none was toggled based on connectionState, which
-            caused play() to silently fail on some browsers because playing a
-            hidden element is blocked. Instead we overlay a placeholder div on
-            top and hide the placeholder (not the video) when connected. */}
+        {/* The remote video element is ALWAYS present in the DOM.
+            A placeholder div is overlaid when not yet connected. Playing a
+            hidden element is blocked on some browsers, so we hide the
+            placeholder rather than the video. */}
         <div className="video-wrapper">
           <video
             ref={remoteVideoRef}

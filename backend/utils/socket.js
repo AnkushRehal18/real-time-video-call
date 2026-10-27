@@ -80,6 +80,16 @@ const initializeSocket = (server) => {
       origin,
       methods: ["GET", "POST"],
     },
+    // Explicit ping/timeout values.
+    // Default pingInterval=25000, pingTimeout=20000. Render's free-tier HTTP
+    // proxy has an ~30s idle timeout on long-poll connections. These values
+    // keep long-poll alive under that limit while not masking genuine
+    // disconnections. WebSocket upgrade (which bypasses the proxy timeout)
+    // is preferred; long-poll is only the fallback during upgrade.
+    pingInterval: 10000,  // send a ping every 10s
+    pingTimeout: 15000,   // wait 15s for pong before treating as disconnected
+    // Allow up to 10s for the initial HTTP handshake to complete.
+    connectTimeout: 10000,
   });
 
   registerSocketHandlers(io);
