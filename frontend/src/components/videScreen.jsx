@@ -54,6 +54,18 @@ function VideoScreen() {
   const socketRef = useRef(null);
 
   // ---------------------------------------------------------------------------
+  // Floating local-camera PiP state
+  //
+  // These refs and state vars exist purely for presentation (draggable mini-
+  // video overlay). They do not interact with WebRTC, media streams, or
+  // signaling. localVideoRef and remoteVideoRef are reused as-is.
+  // ---------------------------------------------------------------------------
+  const [pipPos, setPipPos] = useState({ x: 0, y: 0 }); // position in px
+  const [pipFit, setPipFit] = useState("cover");         // "cover" | "contain"
+  const pipDragRef = useRef(null);   // { startX, startY, origX, origY, id }
+  const pipContainerRef = useRef(null); // bounds the draggable area
+
+  // ---------------------------------------------------------------------------
   // Media-ready promise + generation counter
   //
   // mediaReadyRef    — Promise<MediaStream|null> that resolves when the current
@@ -1012,6 +1024,87 @@ function VideoScreen() {
   };
 
   // ---------------------------------------------------------------------------
+  // Local-camera PiP drag handlers (presentation only)
+  // Works with both mouse and touch. Clamps to the container bounds so the
+  // preview can never leave the visible video area.
+  // ---------------------------------------------------------------------------
+
+  const onPipPointerDown = useCallback((e) => {
+    // Only start drag on primary button / single touch
+    if (e.button !== undefined && e.button !== 0) return;
+
+    const container = pipContainerRef.current;
+    if (!container) return;
+
+    const rect = container.getBoundingClientRect();
+    pipDragRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      origX: pipPos.x,
+      origY: pipPos.y,
+      containerW: rect.width,
+      containerH: rect.height,
+    };
+
+    // Capture the pointer so we keep receiving move events even if the cursor
+    // leaves the overlay. This also makes touch dragging work reliably.
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    e.preventDefault();
+  }, [pipPos.x, pipPos.y]);
+
+  const onPipPointerMove = useCallback((e) => {
+    const drag = pipDragRef.current;
+    if (!drag) return;
+
+    const dx = e.clientX - drag.startX;
+    const dy = e.clientY - drag.startY;
+
+    // Get the PiP element size from the event target's parent (the .pip wrapper)
+    const pipEl = e.currentTarget;
+    const pipW = pipEl.offsetWidth;
+    const pipH = pipEl.offsetHeight;
+
+    // Clamp so the PiP stays fully inside the container
+    const maxX = drag.containerW - pipW;
+    const maxY = drag.containerH - pipH;
+
+    let newX = drag.origX + dx;
+    let newY = drag.origY + dy;
+
+    newX = Math.max(0, Math.min(newX, maxX));
+    newY = Math.max(0, Math.min(newY, maxY));
+
+    setPipPos({ x: newX, y: newY });
+  }, []);
+
+  const onPipPointerUp = useCallback((e) => {
+    pipDragRef.current = null;
+    e.currentTarget.releasePointerCapture?.(e.pointerId);
+  }, []);
+
+  const togglePipFit = useCallback(() => {
+    setPipFit((prev) => (prev === "cover" ? "contain" : "cover"));
+  }, []);
+
+  // Initialize the PiP position to the top-right corner once the stage is
+  // rendered. We use a ref-callback on the container to measure it, then set
+  // the position accounting for the PiP width and a margin.
+  const onPipContainerRef = useCallback((node) => {
+    pipContainerRef.current = node;
+    if (node && pipPos.x === 0 && pipPos.y === 0) {
+      // Defer measurement until after the layout settles.
+      requestAnimationFrame(() => {
+        const rect = node.getBoundingClientRect();
+        const pipW = node.querySelector(".pip-wrapper")?.offsetWidth ?? 130;
+        setPipPos({
+          x: rect.width - pipW - 16,
+          y: 16,
+        });
+      });
+    }
+  }, [pipPos.x, pipPos.y]);
+
+  // ---------------------------------------------------------------------------
   // Render
   // ---------------------------------------------------------------------------
 
@@ -1071,31 +1164,23 @@ function VideoScreen() {
         </p>
       </header>
 
-      <section className="video-container">
-        <div className="video-wrapper">
-          <video
-            ref={localVideoRef}
-            autoPlay
-            playsInline
-            muted
-            className="video-element"
-          />
-          <div className="video-label">{CAMERA_LABEL}</div>
-        </div>
-
-        {/* The remote video element is ALWAYS present in the DOM.
-            A placeholder div is overlaid when not yet connected. Playing a
-            hidden element is blocked on some browsers, so we hide the
-            placeholder rather than the video. */}
-        <div className="video-wrapper">
+      {/* ── Full-screen remote video stage ──────────────────────────────────
+          The remote participant is the main full-screen video. The local
+          camera floats on top as a draggable PiP overlay. */}
+      <section
+        className="video-stage"
+        ref={onPipContainerRef}
+      >
+        {/* Remote video — full width and height of the stage */}
+        <div className="remote-video-wrapper">
           <video
             ref={remoteVideoRef}
             autoPlay
             playsInline
-            className="video-element"
+            className="video-element remote-video"
           />
           {connectionState !== "connected" && (
-            <div className="video-placeholder">
+            <div className="video-placeholder remote-placeholder">
               <p>
                 {connectionState === "connecting"
                   ? "Connecting…"
@@ -1107,7 +1192,41 @@ function VideoScreen() {
               </p>
             </div>
           )}
-          <div className="video-label">Remote participant</div>
+          <div className="video-label remote-label">Remote participant</div>
+        </div>
+
+        {/* Local camera — floating draggable PiP overlay */}
+        {/* Position is applied via inline style from state so it updates on
+            every drag move. The initial position is set by the CSS default
+            (top-right) until the first drag, but we initialize pipPos in the
+            effect below to match the rendered default. */}
+        <div
+          className="pip-wrapper"
+          style={{
+            transform: `translate(${pipPos.x}px, ${pipPos.y}px)`,
+          }}
+          onPointerDown={onPipPointerDown}
+          onPointerMove={onPipPointerMove}
+          onPointerUp={onPipPointerUp}
+          onPointerCancel={onPipPointerUp}
+        >
+          <video
+            ref={localVideoRef}
+            autoPlay
+            playsInline
+            muted
+            className="video-element pip-video"
+            style={{ objectFit: pipFit }}
+          />
+          <div className="pip-label">{CAMERA_LABEL}</div>
+          <button
+            className="pip-toggle-fit"
+            onClick={togglePipFit}
+            aria-label="Toggle video fit"
+            title={pipFit === "cover" ? "Switch to Fit" : "Switch to Cover"}
+          >
+            {pipFit === "cover" ? "⤢" : "⤡"}
+          </button>
         </div>
       </section>
 

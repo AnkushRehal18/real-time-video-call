@@ -304,10 +304,146 @@ input:focus {
 .video-call {
   display: flex;
   flex-direction: column;
-  gap: var(--space-lg);
+  gap: var(--space-md);
+  /* Use the full viewport height so the remote video fills the screen.
+     The header and controls live above/below the stage. */
+  min-height: 100vh;
 }
 
-/* ── Video container ──────────────────────────────────────────────────────── */
+/* ── Full-screen remote video stage ────────────────────────────────────────── */
+
+.video-stage {
+  position: relative;
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;          /* allow flex child to shrink */
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: #000;
+  /* Use safe-area insets on mobile so the video respects notches/home bar */
+  padding:
+    env(safe-area-inset-top, 0)
+    env(safe-area-inset-right, 0)
+    env(safe-area-inset-bottom, 0)
+    env(safe-area-inset-left, 0);
+  touch-action: none;      /* prevent browser gestures interfering with drag */
+}
+
+.remote-video-wrapper {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: #000;
+}
+
+.remote-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+  display: block;
+}
+
+/* ── Remote placeholder overlay ───────────────────────────────────────────── */
+
+.remote-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  font-size: 15px;
+  text-align: center;
+  padding: var(--space-lg);
+  z-index: 1;
+}
+
+.remote-label {
+  position: absolute;
+  bottom: var(--space-md);
+  left: var(--space-md);
+  z-index: 2;
+}
+
+/* ── Local camera floating PiP overlay ────────────────────────────────────── */
+
+.pip-wrapper {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 130px;
+  aspect-ratio: 3 / 4;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  box-shadow: var(--shadow-lg);
+  cursor: grab;
+  z-index: 10;
+  background: #000;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.pip-wrapper:active {
+  cursor: grabbing;
+}
+
+.pip-video {
+  width: 100%;
+  height: 100%;
+  object-position: center;
+  display: block;
+  /* Mirrored for natural self-view */
+  transform: scaleX(-1);
+}
+
+.pip-label {
+  position: absolute;
+  bottom: 4px;
+  left: 4px;
+  padding: 2px 8px;
+  background: var(--bg-overlay);
+  border-radius: var(--radius-sm);
+  font-size: 10px;
+  font-weight: 600;
+  color: white;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  pointer-events: none;
+  z-index: 2;
+}
+
+.pip-toggle-fit {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--bg-overlay);
+  color: white;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 3;
+}
+
+.pip-toggle-fit:hover {
+  background: rgba(0, 0, 0, 0.7);
+}
+
+/* ── Legacy grid layout (no longer used but kept for safety) ───────────────── */
 
 .video-container {
   display: grid;
@@ -324,21 +460,7 @@ input:focus {
   overflow: hidden;
   border: 1px solid var(--border-subtle);
   box-shadow: var(--shadow-md);
-  transition: border-color var(--transition);
 }
-
-.video-wrapper:hover {
-  border-color: var(--border-default);
-}
-
-.video-element {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
-
-/* ── Video placeholder (waiting / connecting states) ──────────────────────── */
 
 .video-placeholder {
   position: absolute;
@@ -353,14 +475,6 @@ input:focus {
   padding: var(--space-lg);
   z-index: 1;
 }
-
-.video-placeholder p {
-  display: flex;
-  align-items: center;
-  gap: var(--space-sm);
-}
-
-/* ── Video label badge ───────────────────────────────────────────────────── */
 
 .video-label {
   position: absolute;
@@ -563,71 +677,87 @@ input:focus {
     padding: var(--space-md);
   }
 
-  .video-container {
-    gap: var(--space-sm);
-  }
-
   .control-button {
     min-width: 110px;
     font-size: 13px;
     padding: 11px var(--space-sm);
+  }
+
+  /* Slightly larger PiP on tablets */
+  .pip-wrapper {
+    width: 140px;
   }
 }
 
 /* ── Mobile (portrait) ────────────────────────────────────────────────────── */
 @media (max-width: 640px) {
   .app {
-    padding: var(--space-md);
+    padding: var(--space-xs);
   }
 
   .app-header {
-    margin-bottom: var(--space-lg);
+    margin-bottom: var(--space-sm);
   }
 
   .app-header h1 {
-    font-size: 18px;
+    font-size: 16px;
   }
 
   .status {
-    font-size: 12px;
+    font-size: 11px;
     padding: 3px var(--space-sm);
   }
 
-  /* Stack videos vertically on mobile */
-  .video-container {
-    grid-template-columns: 1fr;
+  /* Full-screen remote video on mobile */
+  .video-call {
+    gap: var(--space-sm);
   }
 
-  .video-wrapper {
-    aspect-ratio: 4 / 3;
+  .video-stage {
+    border-radius: var(--radius-md);
   }
 
-  /* Full-width remote video on mobile, with local as a PiP overlay */
-  /* We keep the grid stacked so both <video> elements stay mounted and
-     playable — the remote element is never hidden via display:none. */
-  .video-wrapper:first-child {
-    aspect-ratio: 16 / 9;
+  /* Smaller PiP on mobile: 110–140px range */
+  .pip-wrapper {
+    width: 115px;
+    border-width: 2px;
+    border-radius: var(--radius-md);
   }
 
-  .video-label {
-    font-size: 11px;
-    padding: 4px var(--space-sm);
+  .pip-label {
+    font-size: 9px;
+    padding: 2px 6px;
+  }
+
+  .pip-toggle-fit {
+    width: 20px;
+    height: 20px;
+    font-size: 12px;
+  }
+
+  .remote-label {
     bottom: var(--space-sm);
     left: var(--space-sm);
+    font-size: 10px;
+    padding: 4px var(--space-sm);
   }
 
   .room-controls {
-    padding: var(--space-md);
+    padding: var(--space-sm) var(--space-md);
+    border-radius: var(--radius-md);
+    gap: var(--space-sm);
   }
 
   .room-controls .room-info {
     flex-direction: column;
     align-items: stretch;
     gap: var(--space-xs);
+    padding: var(--space-xs) var(--space-sm);
   }
 
   .room-controls .room-info code {
     text-align: center;
+    font-size: 13px;
   }
 
   .room-controls .room-info button {
@@ -641,8 +771,8 @@ input:focus {
   .control-button {
     flex: 1 1 calc(50% - var(--space-xs));
     min-width: 0;
-    font-size: 13px;
-    padding: 12px var(--space-sm);
+    font-size: 12px;
+    padding: 10px var(--space-sm);
   }
 
   .end-call-button {
@@ -659,20 +789,24 @@ input:focus {
   }
 
   .message {
-    font-size: 13px;
+    font-size: 12px;
   }
 }
 
 /* ── Very small screens ───────────────────────────────────────────────────── */
 @media (max-width: 380px) {
   .app {
-    padding: var(--space-sm);
+    padding: 4px;
   }
 
   .app-header {
     flex-direction: column;
     align-items: flex-start;
-    gap: var(--space-sm);
+    gap: 4px;
+  }
+
+  .pip-wrapper {
+    width: 110px;
   }
 
   .control-button {
@@ -687,27 +821,38 @@ input:focus {
 /* ── Landscape on mobile / short heights ──────────────────────────────────── */
 @media (max-height: 500px) and (orientation: landscape) {
   .app {
-    padding: var(--space-sm);
+    padding: var(--space-xs);
   }
 
   .app-header {
-    margin-bottom: var(--space-md);
+    margin-bottom: var(--space-xs);
   }
 
-  .video-container {
-    grid-template-columns: 1fr 1fr;
-    gap: var(--space-sm);
+  .video-call {
+    gap: var(--space-xs);
   }
 
-  .video-wrapper {
-    aspect-ratio: 16 / 9;
+  /* In landscape the remote video fills the whole area between header and
+     the compact controls bar. */
+  .video-stage {
+    border-radius: var(--radius-sm);
+  }
+
+  .pip-wrapper {
+    width: 100px;
   }
 
   .room-controls {
-    padding: var(--space-sm) var(--space-md);
+    padding: var(--space-xs) var(--space-md);
+    gap: var(--space-xs);
   }
 
   .call-controls {
-    margin-top: var(--space-xs);
+    margin-top: 2px;
+  }
+
+  .control-button {
+    padding: 8px var(--space-sm);
+    font-size: 12px;
   }
 }
