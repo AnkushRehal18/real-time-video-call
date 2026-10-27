@@ -1022,7 +1022,10 @@ function VideoScreen() {
           <h1>VideoCall</h1>
         </header>
         <section className="room-card">
-          <p className="subtitle">Create a room or join a friend&apos;s room.</p>
+          <p className="subtitle">
+            Start a video call instantly. Create a room and share the ID, or
+            join an existing room.
+          </p>
 
           <p className={connected ? "status connected" : "status"}>
             <span className="status-dot" />
@@ -1095,12 +1098,12 @@ function VideoScreen() {
             <div className="video-placeholder">
               <p>
                 {connectionState === "connecting"
-                  ? "Connecting..."
+                  ? "Connecting…"
                   : connectionState === "failed"
                   ? "Connection failed"
                   : participantJoined
                   ? "Remote participant"
-                  : "Waiting for another participant..."}
+                  : "Waiting for another participant…"}
               </p>
             </div>
           )}
@@ -1121,7 +1124,9 @@ function VideoScreen() {
         </div>
 
         <div className="participant-status">
-          <span className="status-dot" />
+          <span
+            className={`status-dot ${participantJoined ? "connected" : ""}`}
+          />
           {participantJoined ? "Participant joined" : "Waiting for participant"}
         </div>
 
@@ -1132,7 +1137,26 @@ function VideoScreen() {
             aria-label={isMicMuted ? "Unmute microphone" : "Mute microphone"}
             disabled={!hasLocalStream}
           >
-            {isMicMuted ? "🎤 Unmute" : "🎤 Mute"}
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+              stroke="currentColor" strokeWidth="2" strokeLinecap="round"
+              strokeLinejoin="round" aria-hidden="true">
+              {isMicMuted ? (
+                <>
+                  <line x1="1" y1="1" x2="23" y2="23" />
+                  <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" />
+                  <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" />
+                  <line x1="12" y1="19" x2="12" y2="23" />
+                </>
+              ) : (
+                <>
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                  <line x1="12" y1="19" x2="12" y2="23" />
+                  <line x1="8" y1="23" x2="16" y2="23" />
+                </>
+              )}
+            </svg>
+            {isMicMuted ? "Unmute" : "Mute"}
           </button>
 
           <button
@@ -1141,7 +1165,22 @@ function VideoScreen() {
             aria-label={isCameraOff ? "Turn on camera" : "Turn off camera"}
             disabled={!hasLocalStream}
           >
-            {isCameraOff ? "📷 On" : "📷 Off"}
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+              stroke="currentColor" strokeWidth="2" strokeLinecap="round"
+              strokeLinejoin="round" aria-hidden="true">
+              {isCameraOff ? (
+                <>
+                  <line x1="1" y1="1" x2="23" y2="23" />
+                  <path d="M21 21H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h3m3-3h6l2 3h4a2 2 0 0 1 2 2v9.34" />
+                </>
+              ) : (
+                <>
+                  <path d="M23 7l-7 5 7 5V7z" />
+                  <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+                </>
+              )}
+            </svg>
+            {isCameraOff ? "On" : "Off"}
           </button>
 
           <button
@@ -1149,7 +1188,13 @@ function VideoScreen() {
             onClick={endCall}
             aria-label="End call"
           >
-            📞 End Call
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+              stroke="currentColor" strokeWidth="2" strokeLinecap="round"
+              strokeLinejoin="round" aria-hidden="true">
+              <path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91" />
+              <line x1="23" y1="1" x2="1" y2="23" />
+            </svg>
+            End Call
           </button>
         </div>
 
