@@ -46,14 +46,14 @@ const candidateMeta = (candidate) => {
 
   if (typeof candidate.candidate === "string" && candidate.candidate.length > 0) {
     const parts = candidate.candidate.split(" ");
-    component     = parts[1] ?? null;
-    protocol      = parts[2] ?? null;
+    component = parts[1] ?? null;
+    protocol = parts[2] ?? null;
     candidateType = parts[7] ?? null;
   }
 
   return {
     present: true,
-    sdpMid:        typeof candidate.sdpMid === "string" ? candidate.sdpMid : null,
+    sdpMid: typeof candidate.sdpMid === "string" ? candidate.sdpMid : null,
     sdpMLineIndex: candidate.sdpMLineIndex ?? null,
     protocol,
     component,
@@ -104,9 +104,9 @@ const registerWebRTCHandlers = (io, socket) => {
     // Validate: roomId present
     if (!roomId) {
       logger.warn("webrtc-offer dropped: missing roomId", {
-        event:          "webrtc-offer",
+        event: "webrtc-offer",
         senderSocketId: socket.id,
-        dropReason:     "missing_room_id",
+        dropReason: "missing_room_id",
       });
       return;
     }
@@ -114,10 +114,10 @@ const registerWebRTCHandlers = (io, socket) => {
     // Validate: payload present
     if (!offer) {
       logger.warn("webrtc-offer dropped: missing offer payload", {
-        event:          "webrtc-offer",
+        event: "webrtc-offer",
         senderSocketId: socket.id,
         roomId,
-        dropReason:     "missing_offer_payload",
+        dropReason: "missing_offer_payload",
       });
       return;
     }
@@ -125,10 +125,10 @@ const registerWebRTCHandlers = (io, socket) => {
     // Validate: sender is authorised (must be in the room)
     if (!socket.rooms.has(roomId)) {
       logger.warn("webrtc-offer dropped: sender not in room", {
-        event:          "webrtc-offer",
+        event: "webrtc-offer",
         senderSocketId: socket.id,
         roomId,
-        dropReason:     "sender_not_in_room",
+        dropReason: "sender_not_in_room",
       });
       return;
     }
@@ -137,22 +137,22 @@ const registerWebRTCHandlers = (io, socket) => {
 
     if (recipientCount === 0) {
       logger.warn("webrtc-offer dropped: no recipients in room", {
-        event:          "webrtc-offer",
+        event: "webrtc-offer",
         senderSocketId: socket.id,
         roomId,
-        dropReason:     "no_recipients",
-        offer:          descriptionMeta(offer),
+        dropReason: "no_recipients",
+        offer: descriptionMeta(offer),
       });
       return;
     }
 
     logger.info("webrtc-offer forwarded", {
-      event:            "webrtc-offer",
-      senderSocketId:   socket.id,
+      event: "webrtc-offer",
+      senderSocketId: socket.id,
       roomId,
       recipientIds,       // socket ID(s) that will receive the event
       recipientCount,
-      offer:            descriptionMeta(offer),
+      offer: descriptionMeta(offer),
       // Note: socket.to().emit() is fire-and-forget; this log confirms the
       // emit was attempted, not that the remote browser received or applied it.
       forwardAttempted: true,
@@ -169,29 +169,29 @@ const registerWebRTCHandlers = (io, socket) => {
 
     if (!roomId) {
       logger.warn("webrtc-answer dropped: missing roomId", {
-        event:          "webrtc-answer",
+        event: "webrtc-answer",
         senderSocketId: socket.id,
-        dropReason:     "missing_room_id",
+        dropReason: "missing_room_id",
       });
       return;
     }
 
     if (!answer) {
       logger.warn("webrtc-answer dropped: missing answer payload", {
-        event:          "webrtc-answer",
+        event: "webrtc-answer",
         senderSocketId: socket.id,
         roomId,
-        dropReason:     "missing_answer_payload",
+        dropReason: "missing_answer_payload",
       });
       return;
     }
 
     if (!socket.rooms.has(roomId)) {
       logger.warn("webrtc-answer dropped: sender not in room", {
-        event:          "webrtc-answer",
+        event: "webrtc-answer",
         senderSocketId: socket.id,
         roomId,
-        dropReason:     "sender_not_in_room",
+        dropReason: "sender_not_in_room",
       });
       return;
     }
@@ -200,22 +200,22 @@ const registerWebRTCHandlers = (io, socket) => {
 
     if (recipientCount === 0) {
       logger.warn("webrtc-answer dropped: no recipients in room", {
-        event:          "webrtc-answer",
+        event: "webrtc-answer",
         senderSocketId: socket.id,
         roomId,
-        dropReason:     "no_recipients",
-        answer:         descriptionMeta(answer),
+        dropReason: "no_recipients",
+        answer: descriptionMeta(answer),
       });
       return;
     }
 
     logger.info("webrtc-answer forwarded", {
-      event:            "webrtc-answer",
-      senderSocketId:   socket.id,
+      event: "webrtc-answer",
+      senderSocketId: socket.id,
       roomId,
       recipientIds,
       recipientCount,
-      answer:           descriptionMeta(answer),
+      answer: descriptionMeta(answer),
       forwardAttempted: true,
     });
 
@@ -230,30 +230,30 @@ const registerWebRTCHandlers = (io, socket) => {
 
     if (!roomId) {
       logger.warn("webrtc-ice-candidate dropped: missing roomId", {
-        event:          "webrtc-ice-candidate",
+        event: "webrtc-ice-candidate",
         senderSocketId: socket.id,
-        dropReason:     "missing_room_id",
+        dropReason: "missing_room_id",
       });
       return;
     }
 
     if (!candidate) {
       logger.warn("webrtc-ice-candidate dropped: missing candidate payload", {
-        event:          "webrtc-ice-candidate",
+        event: "webrtc-ice-candidate",
         senderSocketId: socket.id,
         roomId,
-        dropReason:     "missing_candidate_payload",
+        dropReason: "missing_candidate_payload",
       });
       return;
     }
 
     if (!socket.rooms.has(roomId)) {
       logger.warn("webrtc-ice-candidate dropped: sender not in room", {
-        event:          "webrtc-ice-candidate",
+        event: "webrtc-ice-candidate",
         senderSocketId: socket.id,
         roomId,
-        dropReason:     "sender_not_in_room",
-        candidate:      candidateMeta(candidate),
+        dropReason: "sender_not_in_room",
+        candidate: candidateMeta(candidate),
       });
       return;
     }
@@ -263,24 +263,25 @@ const registerWebRTCHandlers = (io, socket) => {
     if (recipientCount === 0) {
       // This can happen during teardown; warn so it's visible without being noisy.
       logger.warn("webrtc-ice-candidate dropped: no recipients in room", {
-        event:          "webrtc-ice-candidate",
+        event: "webrtc-ice-candidate",
         senderSocketId: socket.id,
         roomId,
-        dropReason:     "no_recipients",
-        candidate:      candidateMeta(candidate),
+        dropReason: "no_recipients",
+        candidate: candidateMeta(candidate),
       });
       return;
     }
 
-    // ICE candidates are high-frequency; use debug to avoid log flood in prod.
-    // candidateType ("host" | "srflx" | "relay") is the most useful NAT diagnostic.
-    logger.debug("webrtc-ice-candidate forwarded", {
-      event:            "webrtc-ice-candidate",
-      senderSocketId:   socket.id,
+    // TODO: restore to logger.debug after NAT/ICE diagnosis is complete.
+    // Temporarily promoted to info so candidates are visible at LOG_LEVEL=info
+    // on Render. candidateType ("host"|"srflx"|"relay") is the key NAT diagnostic.
+    logger.info("webrtc-ice-candidate forwarded", {
+      event: "webrtc-ice-candidate",
+      senderSocketId: socket.id,
       roomId,
       recipientIds,
       recipientCount,
-      candidate:        candidateMeta(candidate),
+      candidate: candidateMeta(candidate),
       forwardAttempted: true,
     });
 
