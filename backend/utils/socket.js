@@ -5,6 +5,23 @@ const logger = require("./logger");
 const registerRoomHandlers = require("./room.handler");
 const registerWebRTCHandlers = require("./webrtc.handler");
 
+/**
+ * Classify a Socket.IO disconnect reason so the log clearly shows whether
+ * the client is expected to attempt an automatic reconnect.
+ *
+ * Reasons where the client does NOT auto-reconnect:
+ *   "io server disconnect"  – server explicitly called socket.disconnect()
+ *   "io client disconnect"  – client explicitly called socket.disconnect()
+ *
+ * All other built-in reasons (ping timeout, transport close, transport error)
+ * trigger the client's automatic reconnection logic.
+ */
+const disconnectMeta = (reason) => {
+  const clientWillReconnect =
+    reason !== "io server disconnect" && reason !== "io client disconnect";
+  return { reason, clientWillReconnect };
+};
+
 // ── Per-connection event wiring ───────────────────────────────────────────────
 const registerSocketHandlers = (io) => {
   io.on("connection", (socket) => {
@@ -32,7 +49,7 @@ const registerSocketHandlers = (io) => {
     socket.on("disconnect", (reason) => {
       logger.info("Client disconnected", {
         socketId: socket.id,
-        reason,
+        ...disconnectMeta(reason),
       });
     });
 
