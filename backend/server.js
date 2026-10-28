@@ -2,23 +2,32 @@
 
 const express = require("express");
 const http = require("http");
+const cors = require("cors");
 
 const { config } = require("./config/config");
 const logger = require("./utils/logger");
 const { requestLogger, errorLogger } = require("./middleware/requestLogger");
 const healthRouter = require("./routes/health.route");
+const authRouter = require("./routes/auth.route");
 const initializeSocket = require("./utils/socket");
 
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
 
+// Body parsing — must run before any route that reads req.body
 app.use(express.json());
+
+// CORS — restrict to the configured frontend origin, never unrestricted.
+// Credentials are not enabled since this endpoint does not use cookies/sessions.
+const corsOrigin = process.env.FRONTEND_URL || "http://localhost:5173";
+app.use(cors({ origin: corsOrigin, methods: ["GET", "POST"] }));
 
 // HTTP request logging (before routes so every request is captured)
 app.use(requestLogger);
 
 // API routes
 app.use(healthRouter);
+app.use("/api/auth", authRouter);
 
 // Error logging (after routes, before Express default error handler)
 app.use(errorLogger);
