@@ -1,5 +1,5 @@
 
-const { sql } = require("./config/database");
+const { sql } = require("../config/database");
 
 async function testConnection() {
   try {

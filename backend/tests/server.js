@@ -4,12 +4,12 @@ const express = require("express");
 const http = require("http");
 const cors = require("cors");
 
-const { config } = require("./config/config");
-const logger = require("./utils/logger");
-const { requestLogger, errorLogger } = require("./middleware/requestLogger");
-const healthRouter = require("./routes/health.route");
-const authRouter = require("./routes/auth.route");
-const initializeSocket = require("./utils/socket");
+const { config } = require("../config/config");
+const logger = require("../utils/logger");
+const { requestLogger, errorLogger } = require("../middleware/requestLogger");
+const healthRouter = require("../routes/health.route");
+const authRouter = require("../routes/auth.route");
+const initializeSocket = require("../utils/socket");
 
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = express();

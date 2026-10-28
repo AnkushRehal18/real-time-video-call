@@ -86,7 +86,7 @@ async function runUnitTests() {
   };
 
   // Now require the controller — it will get our mocks
-  const authController = require("./controller/auth.controller");
+  const authController = require("../controller/auth.controller");
 
   // Helper to create mock req/res
   function mockReq(body) {
